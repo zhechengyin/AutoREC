@@ -50,6 +50,7 @@ def suggest_redundant_params(
     identifiability_thresh=1e-4,
     participation_thresh=0.2,
     verbose=False,
+    full_output=False,
 ):
     """
     Suggest parameters in the circuit that possibly be redundant and can be dropped.
@@ -83,6 +84,9 @@ def suggest_redundant_params(
         redundancy.
     verbose : bool, optional
         Whether to print detailed information about the analysis.
+    full_output : bool, optional
+        Whether to return the full analysis results including eigenvalues and
+        eigenvectors.
 
     Returns
     -------
@@ -90,11 +94,12 @@ def suggest_redundant_params(
         A list of tuples, where each tuple contains the parameters that are suggested to
         be dropped together.
     """
-    params_array = np.array([val for val in params.values()])
+    param_names = ae.parser.get_parameter_labels(circuit)
+    params_array = np.array([params[name] for name in param_names])
     # Shift ohmic resistor as needed
     Rct = ae.parser.find_ohmic_resistors(circuit)[0]
     Rct_val = params[Rct]
-    Rct_idx = list(params).index(Rct)
+    Rct_idx = param_names.index(Rct)
     Rct_shift = (
         Rct_to_Z_scale * max(Z.real) if Rct_val <= Rct_to_Z_scale * max(Z.real) else 0.0
     )
@@ -106,7 +111,7 @@ def suggest_redundant_params(
 
     # Compute FIM
     eval_fn = eis_wrapper_fn(circuit, freq, "bode")
-    transform = Transform(list(params))
+    transform = Transform(param_names)
     fim_fn = FIM_nd(eval_fn, transform)
     fim = fim_fn(params_array)
     eigvals, eigvecs = np.linalg.eigh(fim)
@@ -147,7 +152,10 @@ def suggest_redundant_params(
         print("Suggested parameters to drop together:")
         for s in suggestions:
             print(s)
-    return suggestions
+    if full_output:
+        return suggestions, eigvals, eigvecs
+    else:
+        return suggestions
 
 
 def simplify_structure_after_drop(
@@ -293,7 +301,7 @@ def full_simplify_redundant_circuit(
     identifiability_thresh=1e-4,
     participation_thresh=0.2,
     empty_parallel_policy="remove",
-    fit_ecm=True,
+    refit_ecm=True,
     verbose=False,
 ):
     """
@@ -320,8 +328,8 @@ def full_simplify_redundant_circuit(
         The threshold for identifying redundant parameters based on FIM eigenvectors.
     empty_parallel_policy : {'remove', 'short'}, optional
         Rule for handling empty branches in parallel blocks when simplifying the circuit.
-    fit_ecm : bool, optional
-        Whether to fit the simplified circuit to the data and return the new parameters.
+    refit_ecm : bool, optional
+        Whether to refit the simplified circuit to the data and return the new parameters.
     verbose : bool, optional
         Whether to print detailed information about the analysis and simplification.
 
@@ -361,7 +369,7 @@ def full_simplify_redundant_circuit(
                 f"{simplified_circuit}"
             )
 
-        if fit_ecm:
+        if refit_ecm:
             # Optionally, we can fit the simplified circuit to the data and get the new
             # parameters.
             p0 = np.array(
