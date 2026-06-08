@@ -302,6 +302,8 @@ def full_simplify_redundant_circuit(
     participation_thresh=0.2,
     empty_parallel_policy="remove",
     refit_ecm=True,
+    fit_ecm=None,
+    fit_kwargs=None,
     verbose=False,
 ):
     """
@@ -330,6 +332,10 @@ def full_simplify_redundant_circuit(
         Rule for handling empty branches in parallel blocks when simplifying the circuit.
     refit_ecm : bool, optional
         Whether to refit the simplified circuit to the data and return the new parameters.
+    fit_ecm : bool, optional
+        Backward-compatible alias for ``refit_ecm``.
+    fit_kwargs : dict, optional
+        Extra keyword arguments passed to ``ae.utils.fit_circuit_parameters``.
     verbose : bool, optional
         Whether to print detailed information about the analysis and simplification.
 
@@ -338,6 +344,10 @@ def full_simplify_redundant_circuit(
     simplified_circuit : str
         The simplified circuit string with suggested redundant parameters dropped.
     """
+
+    if fit_ecm is not None:
+        refit_ecm = fit_ecm
+    fit_kwargs = {} if fit_kwargs is None else dict(fit_kwargs)
 
     suggestions = suggest_redundant_params(
         circuit,
@@ -379,7 +389,7 @@ def full_simplify_redundant_circuit(
                 ]
             )
             simplified_params = ae.utils.fit_circuit_parameters(
-                simplified_circuit, freq, Z, p0
+                simplified_circuit, freq, Z, p0, **fit_kwargs
             )
             # Compute metrics
             if verbose:
