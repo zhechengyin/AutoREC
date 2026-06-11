@@ -188,10 +188,17 @@ class DataGen:
         )
         sampled = np.atleast_2d(sampled)
 
-        return [
+        params_list = [
             {name: float(value) for name, value in zip(param_names, row)}
             for row in sampled
         ]
+
+        # Force generated source-circuit R1 to fixed value
+        for params in params_list:
+            if "R1" in params:
+                params["R1"] = self.r1_value
+
+        return params_list
 
     def params_to_array(
         self,
