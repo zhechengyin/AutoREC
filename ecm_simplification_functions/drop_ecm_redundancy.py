@@ -12,13 +12,13 @@ from objectives import EISObjective
 _EMPTY = object()
 
 
-def normalize_values(values):
-    min_val = np.min(values)
-    max_val = np.max(values)
+def normalize_values(values, reference):
+    min_val = np.min(reference)
+    max_val = np.max(reference)
     return (values - min_val) / (max_val - min_val)
 
 
-def eis_wrapper_fn(circuit, freq, mode="nyquist", normalize=False):
+def eis_wrapper_fn(circuit, freq, Z, mode="nyquist", normalize=False):
     circuit_fn = ae.utils.generate_circuit_fn(circuit)
 
     def eval_fn(params):
@@ -27,15 +27,15 @@ def eis_wrapper_fn(circuit, freq, mode="nyquist", normalize=False):
             Zre = Zpreds.real
             Zim = Zpreds.imag
             if normalize:
-                Zre = normalize_values(Zre)
-                Zim = -normalize_values(-Zim)
+                Zre = normalize_values(Zre, Z.real)
+                Zim = -normalize_values(-Zim, -Z.imag)
             return np.append(Zre, Zim)
         elif mode == "bode":
             mag = np.abs(Zpreds)
             phi = np.angle(Zpreds)
             if normalize:
-                mag = normalize_values(mag)
-                phi = normalize_values(phi)
+                mag = normalize_values(mag, np.abs(Z))
+                phi = normalize_values(phi, np.angle(Z))
             return np.append(np.log10(mag), phi)
 
     return eval_fn
@@ -110,7 +110,7 @@ def suggest_redundant_params(
         pprint(params, sort_dicts=False)
 
     # Compute FIM
-    eval_fn = eis_wrapper_fn(circuit, freq, "bode")
+    eval_fn = eis_wrapper_fn(circuit, freq, Z, "bode")
     transform = Transform(param_names)
     fim_fn = FIM_nd(eval_fn, transform)
     fim = fim_fn(params_array)
@@ -302,8 +302,6 @@ def full_simplify_redundant_circuit(
     participation_thresh=0.2,
     empty_parallel_policy="remove",
     refit_ecm=True,
-    fit_ecm=None,
-    fit_kwargs=None,
     verbose=False,
 ):
     """
@@ -332,10 +330,6 @@ def full_simplify_redundant_circuit(
         Rule for handling empty branches in parallel blocks when simplifying the circuit.
     refit_ecm : bool, optional
         Whether to refit the simplified circuit to the data and return the new parameters.
-    fit_ecm : bool, optional
-        Backward-compatible alias for ``refit_ecm``.
-    fit_kwargs : dict, optional
-        Extra keyword arguments passed to ``ae.utils.fit_circuit_parameters``.
     verbose : bool, optional
         Whether to print detailed information about the analysis and simplification.
 
@@ -344,10 +338,6 @@ def full_simplify_redundant_circuit(
     simplified_circuit : str
         The simplified circuit string with suggested redundant parameters dropped.
     """
-
-    if fit_ecm is not None:
-        refit_ecm = fit_ecm
-    fit_kwargs = {} if fit_kwargs is None else dict(fit_kwargs)
 
     suggestions = suggest_redundant_params(
         circuit,
@@ -389,7 +379,7 @@ def full_simplify_redundant_circuit(
                 ]
             )
             simplified_params = ae.utils.fit_circuit_parameters(
-                simplified_circuit, freq, Z, p0, **fit_kwargs
+                simplified_circuit, freq, Z, p0
             )
             # Compute metrics
             if verbose:
