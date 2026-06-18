@@ -120,6 +120,10 @@ class DataGen:
 
         self.random_ecm_param_names = ae.parser.get_parameter_labels(self.random_ecm_circuit)
         self.random_ecm_fn = ae.utils.generate_circuit_fn(self.random_ecm_circuit)
+        self.max_workflow_iterations = max(
+            2,
+            len(ae.parser.get_component_labels(self.random_ecm_circuit)) + 2,
+        )
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -446,6 +450,107 @@ class DataGen:
         except Exception:
             return circuit, params
 
+    @staticmethod
+    def same_circuit(left: Optional[str], right: Optional[str]) -> bool:
+        if left is None or right is None:
+            return left is right
+
+        return re.sub(r"\s+", "", str(left)) == re.sub(r"\s+", "", str(right))
+
+    def fim_relabel_circuit(
+        self,
+        circuit: str,
+        params: Dict[str, float],
+        Z: np.ndarray,
+    ) -> Tuple[str, Optional[Dict[str, float]], Any]:
+        fim_result = self.full_simplify_redundant_circuit(
+            circuit,
+            self.random_ecm_freq,
+            Z,
+            params,
+            refit_ecm=self.fim_fit_ecm,
+            identifiability_thresh=self.fim_identifiability_thresh,
+            fit_kwargs={
+                "max_iters": self.fim_refit_max_iters,
+                "min_iters": self.fim_refit_min_iters,
+                "max_nfev": self.fim_refit_max_nfev,
+            },
+            verbose=False,
+        )
+
+        return self.choose_fim_relabel(
+            fim_result,
+            circuit,
+            params,
+        )
+
+    def simplify_fim_workflow(
+        self,
+        circuit: str,
+        params: Dict[str, float],
+        Z: np.ndarray,
+    ) -> Dict[str, Any]:
+        """Run source -> simplify -> FIM -> simplify until the requested stop check."""
+
+        current_ecm, current_params = circuit, params
+        first_simplified_ecm = circuit
+        first_simplified_params = params
+        last_fim_ecm: Optional[str] = None
+        last_fim_params: Optional[Dict[str, float]] = None
+        last_fim_candidates: Any = None
+        relabel_ecm, relabel_params = circuit, params
+        iteration = 0
+
+        for _ in range(self.max_workflow_iterations):
+            simplified_ecm, simplified_params = self.simplify_relabel_circuit(
+                current_ecm,
+                current_params,
+            )
+
+            if iteration == 0:
+                first_simplified_ecm = simplified_ecm
+                first_simplified_params = simplified_params
+
+            relabel_ecm, relabel_params = simplified_ecm, simplified_params
+
+            if self.same_circuit(current_ecm, simplified_ecm) and iteration > 0:
+                break
+
+            if not isinstance(simplified_params, dict) or not simplified_params:
+                last_fim_ecm = simplified_ecm
+                last_fim_params = simplified_params
+                break
+
+            fim_ecm, fim_params, fim_candidates = self.fim_relabel_circuit(
+                simplified_ecm,
+                simplified_params,
+                Z,
+            )
+
+            last_fim_ecm = fim_ecm
+            last_fim_params = fim_params
+            last_fim_candidates = fim_candidates
+
+            relabel_ecm, relabel_params = fim_ecm, fim_params
+
+            if self.same_circuit(simplified_ecm, fim_ecm):
+                break
+
+            current_ecm, current_params = fim_ecm, fim_params
+            iteration += 1
+
+        return {
+            "simplified_ecm": first_simplified_ecm,
+            "simplified_params": first_simplified_params,
+            "fim_relabel_ecm": last_fim_ecm or relabel_ecm,
+            "fim_relabel_params": last_fim_params if last_fim_ecm else relabel_params,
+            "post_fim_simplified_ecm": relabel_ecm,
+            "post_fim_simplified_params": relabel_params,
+            "relabel_ecm": relabel_ecm,
+            "relabel_params": relabel_params,
+            "fim_candidates": last_fim_candidates,
+        }
+
     def run_relabel(
         self,
         params_list: Sequence[Dict[str, float]],
@@ -483,48 +588,12 @@ class DataGen:
             }
 
             try:
-                simplified_ecm, simplified_params = self.ecm_parser_simplifier.simplify(
+                workflow_result = self.simplify_fim_workflow(
                     self.random_ecm_circuit,
                     params,
-                )
-
-                fim_result = self.full_simplify_redundant_circuit(
-                    simplified_ecm,
-                    self.random_ecm_freq,
                     Z,
-                    simplified_params,
-                    refit_ecm=self.fim_fit_ecm,
-                    identifiability_thresh=self.fim_identifiability_thresh,
-                    fit_kwargs={
-                        "max_iters": self.fim_refit_max_iters,
-                        "min_iters": self.fim_refit_min_iters,
-                        "max_nfev": self.fim_refit_max_nfev,
-                    },
-                    verbose=False,
                 )
-
-                fim_relabel_ecm, fim_relabel_params, fim_candidates = self.choose_fim_relabel(
-                    fim_result,
-                    simplified_ecm,
-                    simplified_params,
-                )
-
-                relabel_ecm, relabel_params = self.simplify_relabel_circuit(
-                    fim_relabel_ecm,
-                    fim_relabel_params,
-                )
-
-                record.update({
-                    "simplified_ecm": simplified_ecm,
-                    "fim_relabel_ecm": fim_relabel_ecm,
-                    "post_fim_simplified_ecm": relabel_ecm,
-                    "relabel_ecm": relabel_ecm,
-                    "simplified_params": simplified_params,
-                    "fim_relabel_params": fim_relabel_params,
-                    "post_fim_simplified_params": relabel_params,
-                    "relabel_params": relabel_params,
-                    "fim_candidates": fim_candidates,
-                })
+                record.update(workflow_result)
 
             except Exception as exc:
                 record.update({
