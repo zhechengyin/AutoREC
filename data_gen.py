@@ -74,7 +74,61 @@ DEFAULT_PARAM_BOUNDS = {
 
 @dataclass
 class DataGen:
-    """Generate, relabel, balance, and export EIS data for one source ECM."""
+    """Generate, relabel, balance, and export EIS data for one source ECM.
+
+    The class wraps the notebook workflow for random ECM parameter sampling,
+    impedance simulation, curve filtering, diverse curve selection, iterative
+    parser/FIM relabelling, canonical postprocessing, balanced row collection,
+    and export.
+
+    Parameters
+    ----------
+    random_ecm_circuit : str, default="R1-[P2,R3]-[P4,R5]-[P6,R7]"
+        Source ECM used to sample random circuit parameters and simulate EIS
+        curves.
+    random_ecm_freq : numpy.ndarray, optional
+        Frequencies in Hz used for simulation and fitting.
+    output_dir : str or pathlib.Path, default="data"
+        Directory where CSV, plot, and dataprep exports are written.
+    simplification_dir : str or pathlib.Path, default="ecm_simplification_functions"
+        Directory containing the parser and FIM redundancy modules.
+    param_bounds : dict, optional
+        Sampling bounds keyed by component type.
+    n_random_candidates : int, default=5000
+        Number of random parameter sets sampled per batch.
+    max_selected_curves : int, default=100
+        Maximum number of diverse curves selected per batch before relabelling.
+    random_seed : int, default=42
+        Default random seed used when a method does not receive an explicit
+        seed.
+    selection_distance_threshold : float, optional
+        Minimum greedy-selection distance. If ``None``, selection continues
+        until ``max_selected_curves`` or all candidates are exhausted.
+    high_frequency_index : int, default=0
+        Index used for high-frequency endpoint filtering.
+    max_high_frequency_minus_im_norm : float, default=0.1
+        Maximum allowed normalized ``-Im(Z)`` at ``high_frequency_index``.
+    fim_fit_ecm : bool, default=True
+        Whether FIM-simplified circuits are refit to obtain updated parameters.
+    fim_refit_max_iters : int, default=5
+        Maximum outer iterations passed to AutoEIS refitting.
+    fim_refit_min_iters : int, default=2
+        Minimum outer iterations passed to AutoEIS refitting.
+    fim_refit_max_nfev : int, default=200
+        Maximum function evaluations passed to AutoEIS refitting.
+    fim_identifiability_thresh : float, default=1e-6
+        Eigenvalue threshold used by FIM redundancy analysis.
+    r1_value : float, default=0.01
+        Fixed value assigned to the source/canonical ohmic resistor ``R1``.
+    drop_pp_series : bool, default=True
+        Whether final relabelled ECMs with series P-P chains are removed.
+    drop_invalid_ecms : bool, default=True
+        Whether final relabelled ECMs failing ``validity_check_fn`` are removed.
+    validity_check_fn : callable, optional
+        Function receiving a circuit string and returning whether it is valid.
+    verbose : bool, default=True
+        Whether progress messages are printed.
+    """
 
     random_ecm_circuit: str = "R1-[P2,R3]-[P4,R5]-[P6,R7]"
     random_ecm_freq: np.ndarray = field(default_factory=lambda: np.logspace(5, -2, 80))
@@ -104,6 +158,7 @@ class DataGen:
     verbose: bool = True
 
     def __post_init__(self) -> None:
+        """Initialize paths, simplification modules, and source-circuit caches."""
         self.random_ecm_freq = np.asarray(self.random_ecm_freq, dtype=float)
         self.output_dir = Path(self.output_dir)
         self.simplification_dir = Path(self.simplification_dir).resolve()
@@ -132,6 +187,18 @@ class DataGen:
     # ------------------------------------------------------------------
     @staticmethod
     def source_ecm_filename_slug(circuit: str) -> str:
+        """Create a deterministic filesystem-safe slug for a source ECM.
+
+        Parameters
+        ----------
+        circuit : str
+            Circuit string used to build a readable slug and hash suffix.
+
+        Returns
+        -------
+        str
+            Sanitized slug containing a short SHA1 digest.
+        """
         source = str(circuit).strip()
         readable = re.sub(r"\s+", "", source)
         readable = re.sub(r"[^A-Za-z0-9._,\[\]-]+", "_", readable).strip("._-")
@@ -140,6 +207,20 @@ class DataGen:
 
     @staticmethod
     def split_top_level(text: str, sep: str = ",") -> List[str]:
+        """Split a circuit string at a separator outside nested brackets.
+
+        Parameters
+        ----------
+        text : str
+            Circuit fragment to split.
+        sep : str, default=","
+            Separator to split on when bracket depth is zero.
+
+        Returns
+        -------
+        list of str
+            Top-level fragments preserving nested bracket content.
+        """
         parts, current, depth = [], [], 0
 
         for ch in str(text):
@@ -157,6 +238,18 @@ class DataGen:
 
     @staticmethod
     def _parallel_sort_key(item: str) -> int:
+        """Return the canonical sort group for a parallel-branch item.
+
+        Parameters
+        ----------
+        item : str
+            Branch item from a parallel block.
+
+        Returns
+        -------
+        int
+            Sort group, with CPE elements before resistors and other elements.
+        """
         first = item.strip()[:1]
         if first == "P":
             return 0
@@ -165,6 +258,13 @@ class DataGen:
         return 2
 
     def _log(self, message: str) -> None:
+        """Print a progress message when verbose logging is enabled.
+
+        Parameters
+        ----------
+        message : str
+            Message to print.
+        """
         if self.verbose:
             print(message)
 
@@ -178,6 +278,24 @@ class DataGen:
         param_names: Optional[Sequence[str]] = None,
         param_bounds: Optional[Dict[str, Tuple[float, float]]] = None,
     ) -> List[Dict[str, float]]:
+        """Sample random source-circuit parameter dictionaries.
+
+        Parameters
+        ----------
+        n_candidates : int, optional
+            Number of random samples. Defaults to ``self.n_random_candidates``.
+        seed : int, optional
+            Random seed. Defaults to ``self.random_seed``.
+        param_names : sequence of str, optional
+            Parameter labels to use when converting sampled arrays to dicts.
+        param_bounds : dict, optional
+            Sampling bounds keyed by component type.
+
+        Returns
+        -------
+        list of dict
+            Parameter dictionaries keyed by AutoEIS parameter label.
+        """
         n_candidates = self.n_random_candidates if n_candidates is None else n_candidates
         seed = self.random_seed if seed is None else seed
         param_names = self.random_ecm_param_names if param_names is None else list(param_names)
@@ -209,11 +327,37 @@ class DataGen:
         params: Dict[str, float],
         param_names: Optional[Sequence[str]] = None,
     ) -> np.ndarray:
+        """Convert a parameter dictionary to an array ordered by labels.
+
+        Parameters
+        ----------
+        params : dict
+            Parameter dictionary keyed by circuit parameter label.
+        param_names : sequence of str, optional
+            Desired output order. Defaults to source-circuit labels.
+
+        Returns
+        -------
+        numpy.ndarray
+            Parameter values in ``param_names`` order.
+        """
         param_names = self.random_ecm_param_names if param_names is None else list(param_names)
         return np.array([params[name] for name in param_names], dtype=float)
 
     @staticmethod
     def normalize_curve(Z: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Normalize impedance data into unit-range Nyquist coordinates.
+
+        Parameters
+        ----------
+        Z : numpy.ndarray
+            Complex impedance values.
+
+        Returns
+        -------
+        tuple of numpy.ndarray
+            Normalized real part and normalized ``-imaginary`` part.
+        """
         re_part = np.asarray(Z).real
         minus_im = -np.asarray(Z).imag
 
@@ -226,6 +370,27 @@ class DataGen:
         return re_norm, minus_im_norm
 
     def circuit_params_to_array(self, circuit: str, params: Dict[str, float]) -> np.ndarray:
+        """Convert parameters to the order required by a specific circuit.
+
+        Parameters
+        ----------
+        circuit : str
+            Circuit whose AutoEIS parameter-label order should be used.
+        params : dict
+            Parameter values keyed by label.
+
+        Returns
+        -------
+        numpy.ndarray
+            Parameter values ordered according to ``circuit``.
+
+        Raises
+        ------
+        TypeError
+            If ``params`` is not a dictionary.
+        KeyError
+            If parameters required by ``circuit`` are missing.
+        """
         if not isinstance(params, dict):
             raise TypeError("Circuit parameters must be a dict.")
 
@@ -242,11 +407,41 @@ class DataGen:
         params: Dict[str, float],
         frequencies: Optional[np.ndarray] = None,
     ) -> np.ndarray:
+        """Simulate impedance for an arbitrary circuit and parameter set.
+
+        Parameters
+        ----------
+        circuit : str
+            AutoEIS circuit string to simulate.
+        params : dict
+            Circuit parameters keyed by AutoEIS parameter label.
+        frequencies : numpy.ndarray, optional
+            Frequencies in Hz. Defaults to ``self.random_ecm_freq``.
+
+        Returns
+        -------
+        numpy.ndarray
+            Complex impedance values.
+        """
         frequencies = self.random_ecm_freq if frequencies is None else np.asarray(frequencies, dtype=float)
         circuit_fn = ae.utils.generate_circuit_fn(circuit)
         return circuit_fn(frequencies, self.circuit_params_to_array(circuit, params))
 
     def simulate_relabel_impedance(self, row: pd.Series, frequencies: Optional[np.ndarray] = None) -> np.ndarray:
+        """Simulate impedance using the final relabelled ECM in a result row.
+
+        Parameters
+        ----------
+        row : pandas.Series
+            Result row containing ``relabel_ecm`` and ``relabel_params``.
+        frequencies : numpy.ndarray, optional
+            Frequencies in Hz. Defaults to ``self.random_ecm_freq``.
+
+        Returns
+        -------
+        numpy.ndarray
+            Complex impedance values for the relabelled ECM.
+        """
         return self.simulate_circuit_with_params(
             row["relabel_ecm"],
             row["relabel_params"],
@@ -258,6 +453,20 @@ class DataGen:
         row: pd.Series,
         frequencies: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
+        """Simulate and normalize a relabelled result row.
+
+        Parameters
+        ----------
+        row : pandas.Series
+            Result row containing final relabelled circuit information.
+        frequencies : numpy.ndarray, optional
+            Frequencies in Hz. Defaults to ``self.random_ecm_freq``.
+
+        Returns
+        -------
+        tuple of numpy.ndarray
+            Normalized real and ``-imaginary`` Nyquist coordinates.
+        """
         return self.normalize_curve(self.simulate_relabel_impedance(row, frequencies=frequencies))
 
     def simulate_candidates(
@@ -267,6 +476,25 @@ class DataGen:
         frequencies: Optional[np.ndarray] = None,
         param_names: Optional[Sequence[str]] = None,
     ) -> Tuple[List[Dict[str, float]], List[np.ndarray], List[Tuple[np.ndarray, np.ndarray]]]:
+        """Simulate random candidate parameters and keep finite curves.
+
+        Parameters
+        ----------
+        params_list : sequence of dict
+            Candidate parameter dictionaries.
+        circuit_fn : callable, optional
+            Precompiled AutoEIS circuit function. Defaults to source circuit.
+        frequencies : numpy.ndarray, optional
+            Frequencies in Hz. Defaults to ``self.random_ecm_freq``.
+        param_names : sequence of str, optional
+            Parameter-label order for conversion to arrays.
+
+        Returns
+        -------
+        tuple
+            ``(valid_params, valid_Z, valid_curves)`` where curves are
+            normalized Nyquist coordinates.
+        """
         circuit_fn = self.random_ecm_fn if circuit_fn is None else circuit_fn
         frequencies = self.random_ecm_freq if frequencies is None else np.asarray(frequencies, dtype=float)
         param_names = self.random_ecm_param_names if param_names is None else list(param_names)
@@ -294,6 +522,32 @@ class DataGen:
         high_freq_index: Optional[int] = None,
         max_minus_im_norm: Optional[float] = None,
     ) -> Tuple[List[Dict[str, float]], List[np.ndarray], List[Tuple[np.ndarray, np.ndarray]], Dict[str, Any]]:
+        """Filter candidates with high-frequency ``-Im(Z)`` above a threshold.
+
+        Parameters
+        ----------
+        params_list : sequence of dict
+            Candidate parameter dictionaries.
+        Z_list : sequence of numpy.ndarray
+            Complex impedance curves aligned with ``params_list``.
+        curves : sequence of tuple
+            Normalized Nyquist coordinates aligned with ``params_list``.
+        high_freq_index : int, optional
+            Frequency index used for filtering.
+        max_minus_im_norm : float, optional
+            Maximum allowed normalized ``-Im(Z)`` value.
+
+        Returns
+        -------
+        tuple
+            Filtered parameters, impedance curves, normalized curves, and a
+            dictionary describing the filter operation.
+
+        Raises
+        ------
+        ValueError
+            If every candidate is removed.
+        """
         high_freq_index = self.high_frequency_index if high_freq_index is None else high_freq_index
         max_minus_im_norm = (
             self.max_high_frequency_minus_im_norm
@@ -326,10 +580,36 @@ class DataGen:
 
     @staticmethod
     def stack_curves(curves: Sequence[Tuple[np.ndarray, np.ndarray]]) -> np.ndarray:
+        """Stack normalized curves into a 3D point array.
+
+        Parameters
+        ----------
+        curves : sequence of tuple
+            Normalized real and ``-imaginary`` curve arrays.
+
+        Returns
+        -------
+        numpy.ndarray
+            Array with shape ``(n_curves, n_frequencies, 2)``.
+        """
         return np.stack([np.column_stack(curve) for curve in curves]).astype(np.float32)
 
     @staticmethod
     def mean_curve_distance(curve_points: np.ndarray, reference_curve: np.ndarray) -> np.ndarray:
+        """Compute mean pointwise distance from each curve to a reference.
+
+        Parameters
+        ----------
+        curve_points : numpy.ndarray
+            Stacked curves with shape ``(n_curves, n_frequencies, 2)``.
+        reference_curve : numpy.ndarray
+            Reference curve with shape ``(n_frequencies, 2)``.
+
+        Returns
+        -------
+        numpy.ndarray
+            Mean Euclidean distance for each candidate curve.
+        """
         return np.linalg.norm(curve_points - reference_curve[None, :, :], axis=2).mean(axis=1)
 
     def greedy_select(
@@ -340,6 +620,27 @@ class DataGen:
         k: Optional[int] = None,
         min_distance: Optional[float] = None,
     ) -> Tuple[List[Dict[str, float]], List[np.ndarray], List[Tuple[np.ndarray, np.ndarray]], List[int], List[float]]:
+        """Select a diverse subset of normalized curves greedily.
+
+        Parameters
+        ----------
+        params_list : sequence of dict
+            Candidate parameter dictionaries.
+        Z_list : sequence of numpy.ndarray
+            Complex impedance curves aligned with ``params_list``.
+        curves : sequence of tuple
+            Normalized Nyquist curves aligned with ``params_list``.
+        k : int, optional
+            Maximum number of curves to select.
+        min_distance : float, optional
+            Stop selection when the next best curve is closer than this value.
+
+        Returns
+        -------
+        tuple
+            Selected parameters, impedance curves, normalized curves, original
+            filtered indices, and greedy distance scores.
+        """
         k = self.max_selected_curves if k is None else k
         min_distance = self.selection_distance_threshold if min_distance is None else min_distance
 
@@ -379,6 +680,23 @@ class DataGen:
         n_random_candidates: Optional[int] = None,
         max_selected_curves: Optional[int] = None,
     ) -> Dict[str, Any]:
+        """Run sampling, simulation, high-frequency filtering, and selection.
+
+        Parameters
+        ----------
+        seed : int, optional
+            Random seed for parameter sampling.
+        n_random_candidates : int, optional
+            Number of random samples to generate.
+        max_selected_curves : int, optional
+            Maximum number of curves selected after filtering.
+
+        Returns
+        -------
+        dict
+            Intermediate arrays and metadata for the generate/filter/select
+            portion of the workflow.
+        """
         candidates = self.sample_params(n_candidates=n_random_candidates, seed=seed)
         params, Z, curves = self.simulate_candidates(candidates)
 
@@ -420,6 +738,25 @@ class DataGen:
         fallback_circuit: str,
         fallback_params: Dict[str, float],
     ) -> Tuple[str, Optional[Dict[str, float]], Any]:
+        """Choose the circuit and parameters returned by FIM relabelling.
+
+        Parameters
+        ----------
+        fim_result : object
+            Output from ``full_simplify_redundant_circuit``. It may be a
+            circuit string, a list of circuit strings, a list of
+            ``(circuit, params)`` tuples, or an empty value.
+        fallback_circuit : str
+            Circuit used when FIM does not return a usable replacement.
+        fallback_params : dict
+            Parameters used with ``fallback_circuit``.
+
+        Returns
+        -------
+        tuple
+            Selected circuit, selected parameter dictionary if available, and
+            the original FIM candidates object.
+        """
         if isinstance(fim_result, str):
             return fim_result, fallback_params, []
 
@@ -436,6 +773,22 @@ class DataGen:
         circuit: Optional[str],
         params: Optional[Dict[str, float]],
     ) -> Tuple[Optional[str], Optional[Dict[str, float]]]:
+        """Simplify a relabelled circuit while preserving parameters.
+
+        Parameters
+        ----------
+        circuit : str or None
+            Circuit to simplify.
+        params : dict or None
+            Circuit parameters. When provided, simplification also recomputes
+            equivalent parameter values.
+
+        Returns
+        -------
+        tuple
+            Simplified circuit and parameters. If simplification fails, the
+            original values are returned.
+        """
         if not circuit:
             return circuit, params
 
@@ -452,6 +805,20 @@ class DataGen:
 
     @staticmethod
     def same_circuit(left: Optional[str], right: Optional[str]) -> bool:
+        """Compare two circuit strings while ignoring whitespace.
+
+        Parameters
+        ----------
+        left : str or None
+            First circuit.
+        right : str or None
+            Second circuit.
+
+        Returns
+        -------
+        bool
+            Whether both circuits are equivalent under whitespace removal.
+        """
         if left is None or right is None:
             return left is right
 
@@ -463,6 +830,23 @@ class DataGen:
         params: Dict[str, float],
         Z: np.ndarray,
     ) -> Tuple[str, Optional[Dict[str, float]], Any]:
+        """Run FIM redundancy analysis for one simplified circuit.
+
+        Parameters
+        ----------
+        circuit : str
+            Simplified candidate circuit.
+        params : dict
+            Parameters for ``circuit``.
+        Z : numpy.ndarray
+            Complex impedance curve used for FIM analysis and optional refit.
+
+        Returns
+        -------
+        tuple
+            FIM-selected circuit, selected parameters if available, and all FIM
+            candidates returned by the redundancy module.
+        """
         fim_result = self.full_simplify_redundant_circuit(
             circuit,
             self.random_ecm_freq,
@@ -490,7 +874,30 @@ class DataGen:
         params: Dict[str, float],
         Z: np.ndarray,
     ) -> Dict[str, Any]:
-        """Run source -> simplify -> FIM -> simplify until the requested stop check."""
+        """Run iterative simplify/FIM relabelling for one EIS curve.
+
+        Parameters
+        ----------
+        circuit : str
+            Source circuit used as the first workflow state.
+        params : dict
+            Source-circuit parameters.
+        Z : numpy.ndarray
+            Complex impedance curve generated from the source circuit.
+
+        Returns
+        -------
+        dict
+            Relabelling metadata with the same keys consumed by
+            ``run_relabel`` and downstream postprocessing.
+
+        Notes
+        -----
+        The workflow follows ``C1 -> simplify(C2) -> FIM(C3)``. If
+        ``C1 == C2`` after at least one FIM/simplify cycle, relabelling stops.
+        If ``C2 == C3``, relabelling also stops. Otherwise ``C3`` becomes the
+        next ``C1`` and the process repeats.
+        """
 
         current_ecm, current_params = circuit, params
         first_simplified_ecm = circuit
@@ -559,6 +966,27 @@ class DataGen:
         batch_seed: Optional[int] = None,
         batch_id: Optional[int] = None,
     ) -> pd.DataFrame:
+        """Relabel selected curves with simplify/FIM workflow metadata.
+
+        Parameters
+        ----------
+        params_list : sequence of dict
+            Selected source-circuit parameter dictionaries.
+        Z_list : sequence of numpy.ndarray
+            Selected complex impedance curves.
+        curves : sequence of tuple
+            Selected normalized Nyquist curves.
+        batch_seed : int, optional
+            Seed used to generate the batch.
+        batch_id : int, optional
+            Batch identifier.
+
+        Returns
+        -------
+        pandas.DataFrame
+            One row per selected curve with original data, relabelled ECMs,
+            relabelled parameters, FIM candidates, and failure metadata.
+        """
         rows = []
 
         for selected_position, (params, Z, curve) in enumerate(tqdm(
@@ -610,6 +1038,19 @@ class DataGen:
         return pd.DataFrame(rows)
 
     def has_series_p_chain(self, circuit: Optional[str]) -> bool:
+        """Check whether a circuit contains adjacent series CPE elements.
+
+        Parameters
+        ----------
+        circuit : str or None
+            Circuit string to inspect.
+
+        Returns
+        -------
+        bool
+            ``True`` if a top-level series chain contains adjacent ``P``
+            elements.
+        """
         if circuit is None or pd.isna(circuit):
             return False
 
@@ -626,6 +1067,20 @@ class DataGen:
         df: pd.DataFrame,
         circuit_col: str = "relabel_ecm",
     ) -> pd.DataFrame:
+        """Remove rows whose final ECM contains a series P-P chain.
+
+        Parameters
+        ----------
+        df : pandas.DataFrame
+            Relabelled result table.
+        circuit_col : str, default="relabel_ecm"
+            Column containing circuit strings to inspect.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Filtered result table with reset index.
+        """
         df = df.copy()
         bad_mask = df[circuit_col].apply(self.has_series_p_chain)
 
@@ -639,6 +1094,20 @@ class DataGen:
         df: pd.DataFrame,
         circuit_col: str = "relabel_ecm",
     ) -> pd.DataFrame:
+        """Remove rows whose final ECM fails the configured validity check.
+
+        Parameters
+        ----------
+        df : pandas.DataFrame
+            Relabelled result table.
+        circuit_col : str, default="relabel_ecm"
+            Column containing circuit strings to validate.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Valid relabelled rows with reset index.
+        """
         if self.validity_check_fn is None:
             self._log("Skipping validity_check because no validity_check_fn is available.")
             return df.reset_index(drop=True)
@@ -646,6 +1115,7 @@ class DataGen:
         df = df.copy()
 
         def safe_validity_check(circuit: Any) -> bool:
+            """Return validity-check output while treating exceptions as invalid."""
             try:
                 if circuit is None or pd.isna(circuit):
                     return False
@@ -661,6 +1131,19 @@ class DataGen:
         return df.loc[valid_mask].reset_index(drop=True)
 
     def reorder_parallel_blocks_and_series_p(self, circuit: Optional[str]) -> Optional[str]:
+        """Canonicalize branch order in parallel blocks and series CPE position.
+
+        Parameters
+        ----------
+        circuit : str or None
+            Circuit string to reorder.
+
+        Returns
+        -------
+        str or None
+            Circuit with parallel block items sorted and top-level series CPE
+            elements moved after non-CPE series elements.
+        """
         if circuit is None:
             return circuit
 
@@ -704,6 +1187,21 @@ class DataGen:
         circuit: Optional[str],
         params: Optional[Dict[str, float]] = None,
     ) -> Tuple[Optional[str], Optional[Dict[str, float]]]:
+        """Convert capacitor components to equivalent CPE components.
+
+        Parameters
+        ----------
+        circuit : str or None
+            Circuit string that may contain ``C`` components.
+        params : dict, optional
+            Parameters for ``circuit``. Capacitor values are converted to
+            ``Pw`` values with ``Pn`` set to ``1.0``.
+
+        Returns
+        -------
+        tuple
+            Converted circuit and converted parameter dictionary.
+        """
         if circuit is None:
             return circuit, params
 
@@ -732,6 +1230,21 @@ class DataGen:
         circuit: Optional[str],
         params: Optional[Dict[str, float]] = None,
     ) -> Tuple[Optional[str], Optional[Dict[str, float]]]:
+        """Ensure the canonical circuit starts with a fixed series ``R1``.
+
+        Parameters
+        ----------
+        circuit : str or None
+            Circuit string to normalize.
+        params : dict, optional
+            Parameters aligned with ``circuit``.
+
+        Returns
+        -------
+        tuple
+            Circuit with front series resistor renamed or inserted as ``R1``
+            and parameters updated with ``self.r1_value``.
+        """
         if circuit is None:
             return circuit, params
 
@@ -766,6 +1279,20 @@ class DataGen:
         params: Optional[Dict[str, float]],
         mapping: Dict[str, str],
     ) -> Optional[Dict[str, float]]:
+        """Rename parameter dictionary keys using a component mapping.
+
+        Parameters
+        ----------
+        params : dict or None
+            Parameter dictionary to rename.
+        mapping : dict
+            Component-name mapping, for example ``{"R5": "R2"}``.
+
+        Returns
+        -------
+        dict or None
+            Parameter dictionary with renamed component prefixes.
+        """
         if not isinstance(params, dict):
             return params
 
@@ -785,6 +1312,19 @@ class DataGen:
 
     @staticmethod
     def reindex_components(circuit: Optional[str]) -> Tuple[Optional[str], Dict[str, str]]:
+        """Renumber circuit components into canonical label order.
+
+        Parameters
+        ----------
+        circuit : str or None
+            Circuit string to reindex.
+
+        Returns
+        -------
+        tuple
+            Reindexed circuit and mapping from old component names to new
+            component names.
+        """
         if circuit is None:
             return circuit, {}
 
@@ -828,6 +1368,21 @@ class DataGen:
         circuit: Optional[str],
         params: Optional[Dict[str, float]] = None,
     ) -> Tuple[Optional[str], Optional[Dict[str, float]]]:
+        """Canonicalize a circuit string and its parameter dictionary.
+
+        Parameters
+        ----------
+        circuit : str or None
+            Circuit string to canonicalize.
+        params : dict, optional
+            Parameter dictionary aligned with ``circuit``.
+
+        Returns
+        -------
+        tuple
+            Canonical circuit and parameter dictionary after capacitor
+            conversion, branch reordering, ``R1`` normalization, and reindexing.
+        """
         if circuit is None or pd.isna(circuit):
             return circuit, params
 
@@ -845,6 +1400,19 @@ class DataGen:
         return circuit, params
 
     def postprocess_relabels(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Canonicalize all relabel-related circuit and parameter columns.
+
+        Parameters
+        ----------
+        df : pandas.DataFrame
+            Relabelled result table.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Copy of ``df`` with canonicalized simplified, FIM, post-FIM, and
+            final relabel columns where present.
+        """
         df = df.copy()
 
         for circuit_col, params_col in (
@@ -876,6 +1444,21 @@ class DataGen:
     # ------------------------------------------------------------------
     @staticmethod
     def relabel_group_counts(df: pd.DataFrame, target_labels: Optional[Sequence[str]] = None) -> pd.Series:
+        """Count valid rows per final relabelled ECM.
+
+        Parameters
+        ----------
+        df : pandas.DataFrame
+            Relabelled result table.
+        target_labels : sequence of str, optional
+            Labels to include in the output, with missing labels filled as
+            zero.
+
+        Returns
+        -------
+        pandas.Series
+            Counts indexed by final ``relabel_ecm`` label.
+        """
         source = df.dropna(subset=["relabel_ecm"]).copy()
 
         if "relabel_failed" in source.columns:
@@ -895,6 +1478,24 @@ class DataGen:
         n_random_candidates: Optional[int] = None,
         max_selected_curves: Optional[int] = None,
     ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        """Generate, select, relabel, and filter one random batch.
+
+        Parameters
+        ----------
+        seed : int
+            Random seed for this batch.
+        batch_id : int
+            Batch identifier recorded in output rows.
+        n_random_candidates : int, optional
+            Number of random source-parameter samples.
+        max_selected_curves : int, optional
+            Maximum number of selected curves passed to relabelling.
+
+        Returns
+        -------
+        tuple
+            Batch result DataFrame and batch metadata dictionary.
+        """
         n_random_candidates = self.n_random_candidates if n_random_candidates is None else n_random_candidates
         max_selected_curves = self.max_selected_curves if max_selected_curves is None else max_selected_curves
 
@@ -967,6 +1568,24 @@ class DataGen:
         target_labels: Sequence[str],
         target_per_relabel: int,
     ) -> Tuple[pd.DataFrame, pd.Series]:
+        """Keep only rows still needed to meet target counts.
+
+        Parameters
+        ----------
+        batch_df : pandas.DataFrame
+            Candidate relabelled rows from one batch.
+        counts : pandas.Series
+            Current accumulated count per target label. Updated in place.
+        target_labels : sequence of str
+            Final ECM labels being balanced.
+        target_per_relabel : int
+            Desired number of rows per target label.
+
+        Returns
+        -------
+        tuple
+            Kept rows from ``batch_df`` and updated ``counts``.
+        """
         kept = []
 
         usable = batch_df.dropna(subset=["relabel_ecm"]).copy()
@@ -1002,6 +1621,37 @@ class DataGen:
         n_random_candidates: Optional[int] = None,
         max_selected_curves: Optional[int] = None,
     ) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
+        """Run batches until each target relabelled ECM has enough rows.
+
+        Parameters
+        ----------
+        target_per_relabel : int, default=5
+            Desired number of rows per final relabelled ECM.
+        target_relabel_ecms : sequence of str, optional
+            Explicit target labels. If omitted, labels discovered in the first
+            batch define the balancing target set.
+        min_batches : int, default=1
+            Minimum number of batches to process before allowing early stop.
+        max_batches : int, default=200
+            Maximum number of batches to process.
+        seed_start : int, default=1000
+            First batch seed. Batch ``i`` uses ``seed_start + i``.
+        n_random_candidates : int, optional
+            Number of sampled candidates per batch.
+        max_selected_curves : int, optional
+            Maximum selected curves per batch.
+
+        Returns
+        -------
+        tuple
+            Balanced relabelled rows and list of batch metadata dictionaries.
+
+        Raises
+        ------
+        RuntimeError
+            If the requested balance target is not reached within
+            ``max_batches``.
+        """
         use_manual_targets = target_relabel_ecms is not None
         target_labels = sorted(set(target_relabel_ecms)) if use_manual_targets else None
 
@@ -1070,6 +1720,27 @@ class DataGen:
         target_per_relabel: int,
         target_relabel_ecms: Optional[Sequence[str]] = None,
     ) -> pd.DataFrame:
+        """Trim balanced relabel rows to the final export set.
+
+        Parameters
+        ----------
+        balanced_relabel_results_df : pandas.DataFrame
+            Accumulated balanced relabel results.
+        target_per_relabel : int
+            Number of rows to keep per final relabelled ECM.
+        target_relabel_ecms : sequence of str, optional
+            Optional final label filter.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Final rows sorted by label and annotated with ``global_position``.
+
+        Raises
+        ------
+        RuntimeError
+            If the final trimmed rows do not satisfy ``target_per_relabel``.
+        """
         source_df = balanced_relabel_results_df.dropna(subset=["relabel_ecm"]).copy()
         source_df = source_df.loc[~source_df["relabel_failed"]]
 
@@ -1095,6 +1766,20 @@ class DataGen:
         return final_df
 
     def build_curve_parameter_export_df(self, final_relabel_df: pd.DataFrame) -> pd.DataFrame:
+        """Build the compact CSV export table for final rows.
+
+        Parameters
+        ----------
+        final_relabel_df : pandas.DataFrame
+            Final relabel rows from ``build_final_relabel_df``.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Table containing original ECM, original parameters, final ECM,
+            final parameters, frequency grid, and impedance data as JSON
+            strings.
+        """
         frequency_json = json.dumps([float(value) for value in self.random_ecm_freq])
         rows = []
 
@@ -1133,6 +1818,25 @@ class DataGen:
         target_relabel_ecms: Optional[Sequence[str]] = None,
         csv_path: Optional[str | Path] = None,
     ) -> Tuple[pd.DataFrame, pd.DataFrame, Path]:
+        """Export final relabelled rows to a CSV table.
+
+        Parameters
+        ----------
+        balanced_relabel_results_df : pandas.DataFrame
+            Balanced relabel results before final trimming.
+        target_per_relabel : int, default=5
+            Number of rows to keep per final relabelled ECM.
+        target_relabel_ecms : sequence of str, optional
+            Optional final label filter.
+        csv_path : str or pathlib.Path, optional
+            Destination CSV path. Defaults to a source-ECM-derived filename in
+            ``self.output_dir``.
+
+        Returns
+        -------
+        tuple
+            Final relabel DataFrame, export DataFrame, and written CSV path.
+        """
         final_df = self.build_final_relabel_df(
             balanced_relabel_results_df,
             target_per_relabel=target_per_relabel,
@@ -1157,6 +1861,21 @@ class DataGen:
         final_relabel_df: pd.DataFrame,
         zip_path: Optional[str | Path] = None,
     ) -> Path:
+        """Export Nyquist plots for final relabelled rows into a ZIP archive.
+
+        Parameters
+        ----------
+        final_relabel_df : pandas.DataFrame
+            Final rows containing ``relabel_ecm`` and ``relabel_params``.
+        zip_path : str or pathlib.Path, optional
+            Destination ZIP path. Defaults to a source-ECM-derived filename in
+            ``self.output_dir``.
+
+        Returns
+        -------
+        pathlib.Path
+            Path to the written ZIP archive.
+        """
         import matplotlib.pyplot as plt
 
         if zip_path is None:
@@ -1199,13 +1918,26 @@ class DataGen:
         output_dir: Optional[str | Path] = None,
         use_relabel_simulation: bool = True,
     ) -> Path:
-        """Export one CSV per curve under output_dir/<final_ecm>/.
+        """Export final rows as AutoREC DataPrep-style curve CSV files.
 
-        CSV schema:
-            freq, Z_img, Z_real
+        Parameters
+        ----------
+        final_relabel_df : pandas.DataFrame
+            Final rows containing relabelled ECM metadata and impedance data.
+        output_dir : str or pathlib.Path, optional
+            Root output directory. Defaults to ``self.output_dir``.
+        use_relabel_simulation : bool, default=True
+            If ``True``, regenerate impedance from final relabelled ECMs.
+            Otherwise write the original stored ``Z`` values.
 
-        This is meant to match the common AutoREC DataPrep pattern where each
-        final ECM label has a subdirectory containing individual EIS curve CSVs.
+        Returns
+        -------
+        pathlib.Path
+            Root directory containing one subdirectory per final ECM label.
+
+        Notes
+        -----
+        Each curve CSV has columns ``freq``, ``Z_img``, and ``Z_real``.
         """
 
         output_dir = self.output_dir if output_dir is None else Path(output_dir)
@@ -1248,11 +1980,36 @@ class DataGen:
         export_plots: bool = False,
         export_dataprep: bool = False,
     ) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
-        """Run balanced generation + relabelling.
+        """Run the complete balanced generation and relabelling workflow.
+
+        Parameters
+        ----------
+        target_per_relabel : int, default=5
+            Desired number of rows per final relabelled ECM.
+        target_relabel_ecms : sequence of str, optional
+            Explicit final target labels. If omitted, first-batch labels define
+            the target set.
+        min_batches : int, default=1
+            Minimum number of batches to process.
+        max_batches : int, default=200
+            Maximum number of batches to process.
+        seed_start : int, default=1000
+            First batch seed.
+        n_random_candidates : int, optional
+            Number of random candidates sampled per batch.
+        max_selected_curves : int, optional
+            Maximum selected curves relabelled per batch.
+        export : bool, default=True
+            Whether to write the final CSV export.
+        export_plots : bool, default=False
+            Whether to write a ZIP archive of final Nyquist plots.
+        export_dataprep : bool, default=False
+            Whether to write AutoREC DataPrep-style curve folders.
 
         Returns
         -------
-        balanced_relabel_results_df, batch_infos
+        tuple
+            Balanced relabel result DataFrame and batch metadata list.
         """
 
         balanced_df, batch_infos = self.run_balanced_relabel_dataset(
