@@ -13,12 +13,11 @@ This module contains the non-PCA/non-UMAP workflow from the notebook:
 
 Example
 -------
-from autorec_eis_generator import AutoRECEISGenerator
+from generate_data_pipline.data_gen import DataGen
 
-generator = AutoRECEISGenerator(
+generator = DataGen(
     random_ecm_circuit="R1-[P2,R3]-[P4,R5]-[P6,R7]",
     output_dir="data",
-    simplification_dir="ecm_simplification_functions",
 )
 
 balanced_df, batch_infos = generator.generate_data(
@@ -34,10 +33,8 @@ balanced_df, batch_infos = generator.generate_data(
 from __future__ import annotations
 
 import hashlib
-import importlib
 import json
 import re
-import sys
 import warnings
 import zipfile
 from dataclasses import dataclass, field
@@ -49,10 +46,6 @@ import autoeis as ae
 import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
-
-_PROJECT_SRC = Path(__file__).resolve().parent / "src"
-if _PROJECT_SRC.exists() and str(_PROJECT_SRC) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_SRC))
 
 from autorec import parser as autorec_parser
 
@@ -96,8 +89,6 @@ class DataGen:
         Frequencies in Hz used for simulation and fitting.
     output_dir : str or pathlib.Path, default="data"
         Directory where CSV, plot, and dataprep exports are written.
-    simplification_dir : str or pathlib.Path, default="ecm_simplification_functions"
-        Directory containing the FIM redundancy modules.
     param_bounds : dict, optional
         Sampling bounds keyed by component type.
     n_random_candidates : int, default=5000
@@ -142,7 +133,6 @@ class DataGen:
     random_ecm_circuit: str = "R1-[P2,R3]-[P4,R5]-[P6,R7]"
     random_ecm_freq: np.ndarray = field(default_factory=lambda: np.logspace(5, -2, 80))
     output_dir: str | Path = "data"
-    simplification_dir: str | Path = "ecm_simplification_functions"
     param_bounds: Dict[str, Tuple[float, float]] = field(default_factory=lambda: dict(DEFAULT_PARAM_BOUNDS))
 
     n_random_candidates: int = 5000
@@ -171,17 +161,13 @@ class DataGen:
         """Initialize paths, simplification modules, and source-circuit caches."""
         self.random_ecm_freq = np.asarray(self.random_ecm_freq, dtype=float)
         self.output_dir = Path(self.output_dir)
-        self.simplification_dir = Path(self.simplification_dir).resolve()
-
-        if str(self.simplification_dir) not in sys.path:
-            sys.path.insert(0, str(self.simplification_dir))
 
         self.ecm_parser_simplifier = autorec_parser
-        self.drop_ecm_redundancy = importlib.import_module("drop_ecm_redundancy")
-        self.full_simplify_redundant_circuit = getattr(
-            self.drop_ecm_redundancy,
-            "full_simplify_redundant_circuit",
+        from .ecm_simplification_functions.drop_ecm_redundancy import (
+            full_simplify_redundant_circuit,
         )
+
+        self.full_simplify_redundant_circuit = full_simplify_redundant_circuit
 
         self.random_ecm_param_names = ae.parser.get_parameter_labels(self.random_ecm_circuit)
         self.random_ecm_fn = ae.utils.generate_circuit_fn(self.random_ecm_circuit)
