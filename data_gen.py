@@ -50,8 +50,14 @@ import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
 
+_PROJECT_SRC = Path(__file__).resolve().parent / "src"
+if _PROJECT_SRC.exists() and str(_PROJECT_SRC) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_SRC))
+
+from autorec import parser as autorec_parser
+
 try:
-    from src.autorec.utils import validity_check as default_validity_check
+    from autorec.utils import validity_check as default_validity_check
 except Exception:
     default_validity_check = None
 
@@ -91,7 +97,7 @@ class DataGen:
     output_dir : str or pathlib.Path, default="data"
         Directory where CSV, plot, and dataprep exports are written.
     simplification_dir : str or pathlib.Path, default="ecm_simplification_functions"
-        Directory containing the parser and FIM redundancy modules.
+        Directory containing the FIM redundancy modules.
     param_bounds : dict, optional
         Sampling bounds keyed by component type.
     n_random_candidates : int, default=5000
@@ -124,6 +130,9 @@ class DataGen:
         Whether final relabelled ECMs with series P-P chains are removed.
     drop_invalid_ecms : bool, default=True
         Whether final relabelled ECMs failing ``validity_check_fn`` are removed.
+    excluded_simplified_ecms : sequence of str or None, default=("R1", "R1-C2")
+        Final simplified/relabelled ECM labels to exclude from generated data.
+        Pass an empty sequence to disable this filter.
     validity_check_fn : callable, optional
         Function receiving a circuit string and returning whether it is valid.
     verbose : bool, default=True
@@ -153,6 +162,7 @@ class DataGen:
     r1_value: float = 0.01
     drop_pp_series: bool = True
     drop_invalid_ecms: bool = True
+    excluded_simplified_ecms: Optional[Sequence[str]] = ("R1", "R1-C2")
     validity_check_fn: Optional[Callable[[str], bool]] = default_validity_check
 
     verbose: bool = True
@@ -166,7 +176,7 @@ class DataGen:
         if str(self.simplification_dir) not in sys.path:
             sys.path.insert(0, str(self.simplification_dir))
 
-        self.ecm_parser_simplifier = importlib.import_module("parser")
+        self.ecm_parser_simplifier = autorec_parser
         self.drop_ecm_redundancy = importlib.import_module("drop_ecm_redundancy")
         self.full_simplify_redundant_circuit = getattr(
             self.drop_ecm_redundancy,
@@ -1130,6 +1140,117 @@ class DataGen:
 
         return df.loc[valid_mask].reset_index(drop=True)
 
+    @staticmethod
+    def circuit_key(circuit: Any) -> Optional[str]:
+        """Build a whitespace-insensitive circuit key.
+
+        Parameters
+        ----------
+        circuit : object
+            Circuit-like value to normalize.
+
+        Returns
+        -------
+        str or None
+            Circuit string with whitespace removed, or ``None`` for null
+            values.
+        """
+        if circuit is None:
+            return None
+
+        try:
+            if pd.isna(circuit):
+                return None
+        except (TypeError, ValueError):
+            pass
+
+        return re.sub(r"\s+", "", str(circuit))
+
+    def excluded_simplified_ecm_keys(
+        self,
+        excluded_simplified_ecms: Optional[Sequence[str]] = None,
+    ) -> set[str]:
+        """Build comparable keys for excluded simplified ECM labels.
+
+        Parameters
+        ----------
+        excluded_simplified_ecms : sequence of str or None, optional
+            Exclusion labels. ``None`` uses ``self.excluded_simplified_ecms``.
+
+        Returns
+        -------
+        set of str
+            Whitespace-insensitive original and canonicalized exclusion keys.
+        """
+        excluded_simplified_ecms = (
+            self.excluded_simplified_ecms
+            if excluded_simplified_ecms is None
+            else excluded_simplified_ecms
+        )
+
+        if excluded_simplified_ecms is None:
+            return set()
+
+        if isinstance(excluded_simplified_ecms, str):
+            excluded_simplified_ecms = [excluded_simplified_ecms]
+
+        excluded_keys = set()
+
+        for circuit in excluded_simplified_ecms:
+            key = self.circuit_key(circuit)
+            if key is not None:
+                excluded_keys.add(key)
+
+                cpe_key = self.circuit_key(re.sub(r"C(\d+)", r"P\1", str(circuit)))
+                if cpe_key is not None:
+                    excluded_keys.add(cpe_key)
+
+            try:
+                normalized_circuit, _ = self.normalize_circuit_and_params(circuit)
+                normalized_key = self.circuit_key(normalized_circuit)
+            except Exception:
+                normalized_key = None
+
+            if normalized_key is not None:
+                excluded_keys.add(normalized_key)
+
+        return excluded_keys
+
+    def drop_excluded_simplified_ecms(
+        self,
+        df: pd.DataFrame,
+        excluded_simplified_ecms: Optional[Sequence[str]] = None,
+        circuit_col: str = "relabel_ecm",
+    ) -> pd.DataFrame:
+        """Remove rows whose final simplified ECM is in the exclusion list.
+
+        Parameters
+        ----------
+        df : pandas.DataFrame
+            Relabelled result table.
+        excluded_simplified_ecms : sequence of str or None, optional
+            Exclusion labels. ``None`` uses ``self.excluded_simplified_ecms``.
+        circuit_col : str, default="relabel_ecm"
+            Column containing final simplified/relabelled ECM labels.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Filtered result table with reset index.
+        """
+        excluded_keys = self.excluded_simplified_ecm_keys(excluded_simplified_ecms)
+
+        if not excluded_keys:
+            return df.reset_index(drop=True)
+
+        df = df.copy()
+        excluded_mask = df[circuit_col].apply(lambda circuit: self.circuit_key(circuit) in excluded_keys)
+
+        self._log(f"Dropping {int(excluded_mask.sum())} excluded simplified ECMs")
+        self._log(f"Keeping {int((~excluded_mask).sum())} rows after simplified ECM exclusion")
+
+        return df.loc[~excluded_mask].reset_index(drop=True)
+
     def reorder_parallel_blocks_and_series_p(self, circuit: Optional[str]) -> Optional[str]:
         """Canonicalize branch order in parallel blocks and series CPE position.
 
@@ -1477,6 +1598,7 @@ class DataGen:
         batch_id: int,
         n_random_candidates: Optional[int] = None,
         max_selected_curves: Optional[int] = None,
+        excluded_simplified_ecms: Optional[Sequence[str]] = None,
     ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         """Generate, select, relabel, and filter one random batch.
 
@@ -1490,6 +1612,9 @@ class DataGen:
             Number of random source-parameter samples.
         max_selected_curves : int, optional
             Maximum number of selected curves passed to relabelling.
+        excluded_simplified_ecms : sequence of str or None, optional
+            Final simplified/relabelled ECM labels to exclude. ``None`` uses
+            ``self.excluded_simplified_ecms``.
 
         Returns
         -------
@@ -1529,6 +1654,14 @@ class DataGen:
 
         batch_df = self.postprocess_relabels(batch_df)
 
+        before_excluded_filter_count = len(batch_df)
+        batch_df = self.drop_excluded_simplified_ecms(
+            batch_df,
+            excluded_simplified_ecms=excluded_simplified_ecms,
+            circuit_col="relabel_ecm",
+        )
+        removed_by_excluded_simplified_ecm_filter = before_excluded_filter_count - len(batch_df)
+
         if self.drop_pp_series:
             batch_df = self.drop_series_p_chain_after_relabel(
                 batch_df,
@@ -1557,6 +1690,7 @@ class DataGen:
             "selected_curve_count": len(selected_curves),
             "after_final_filters_count": len(batch_df),
             "removed_by_high_frequency_filter": filter_info["removed_candidate_count"],
+            "removed_by_excluded_simplified_ecm_filter": removed_by_excluded_simplified_ecm_filter,
         }
 
         return batch_df, batch_info
@@ -1620,6 +1754,7 @@ class DataGen:
         seed_start: int = 1000,
         n_random_candidates: Optional[int] = None,
         max_selected_curves: Optional[int] = None,
+        excluded_simplified_ecms: Optional[Sequence[str]] = None,
     ) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
         """Run batches until each target relabelled ECM has enough rows.
 
@@ -1640,6 +1775,9 @@ class DataGen:
             Number of sampled candidates per batch.
         max_selected_curves : int, optional
             Maximum selected curves per batch.
+        excluded_simplified_ecms : sequence of str or None, optional
+            Final simplified/relabelled ECM labels to exclude. ``None`` uses
+            ``self.excluded_simplified_ecms``.
 
         Returns
         -------
@@ -1654,6 +1792,37 @@ class DataGen:
         """
         use_manual_targets = target_relabel_ecms is not None
         target_labels = sorted(set(target_relabel_ecms)) if use_manual_targets else None
+        excluded_keys = self.excluded_simplified_ecm_keys(excluded_simplified_ecms)
+
+        if target_labels is not None and excluded_keys:
+            def target_exclusion_keys(label: str) -> set[str]:
+                """Return raw and canonical exclusion-comparison keys for a target label."""
+                keys = set()
+                key = self.circuit_key(label)
+                if key is not None:
+                    keys.add(key)
+
+                try:
+                    normalized_label, _ = self.normalize_circuit_and_params(label)
+                    normalized_key = self.circuit_key(normalized_label)
+                except Exception:
+                    normalized_key = None
+
+                if normalized_key is not None:
+                    keys.add(normalized_key)
+
+                return keys
+
+            excluded_targets = [
+                label
+                for label in target_labels
+                if target_exclusion_keys(label) & excluded_keys
+            ]
+            if excluded_targets:
+                raise ValueError(
+                    "target_relabel_ecms contains ECMs that are excluded by "
+                    f"excluded_simplified_ecms: {excluded_targets}"
+                )
 
         kept_batches = []
         batch_infos = []
@@ -1667,6 +1836,7 @@ class DataGen:
                 batch_id=batch_id,
                 n_random_candidates=n_random_candidates,
                 max_selected_curves=max_selected_curves,
+                excluded_simplified_ecms=excluded_simplified_ecms,
             )
             batch_infos.append(batch_info)
 
@@ -1719,6 +1889,7 @@ class DataGen:
         balanced_relabel_results_df: pd.DataFrame,
         target_per_relabel: int,
         target_relabel_ecms: Optional[Sequence[str]] = None,
+        excluded_simplified_ecms: Optional[Sequence[str]] = None,
     ) -> pd.DataFrame:
         """Trim balanced relabel rows to the final export set.
 
@@ -1730,6 +1901,9 @@ class DataGen:
             Number of rows to keep per final relabelled ECM.
         target_relabel_ecms : sequence of str, optional
             Optional final label filter.
+        excluded_simplified_ecms : sequence of str or None, optional
+            Final simplified/relabelled ECM labels to exclude. ``None`` uses
+            ``self.excluded_simplified_ecms``.
 
         Returns
         -------
@@ -1746,6 +1920,12 @@ class DataGen:
 
         if target_relabel_ecms is not None:
             source_df = source_df.loc[source_df["relabel_ecm"].isin(target_relabel_ecms)]
+
+        source_df = self.drop_excluded_simplified_ecms(
+            source_df,
+            excluded_simplified_ecms=excluded_simplified_ecms,
+            circuit_col="relabel_ecm",
+        )
 
         final_df = (
             source_df
@@ -1817,6 +1997,7 @@ class DataGen:
         target_per_relabel: int = 5,
         target_relabel_ecms: Optional[Sequence[str]] = None,
         csv_path: Optional[str | Path] = None,
+        excluded_simplified_ecms: Optional[Sequence[str]] = None,
     ) -> Tuple[pd.DataFrame, pd.DataFrame, Path]:
         """Export final relabelled rows to a CSV table.
 
@@ -1831,6 +2012,9 @@ class DataGen:
         csv_path : str or pathlib.Path, optional
             Destination CSV path. Defaults to a source-ECM-derived filename in
             ``self.output_dir``.
+        excluded_simplified_ecms : sequence of str or None, optional
+            Final simplified/relabelled ECM labels to exclude. ``None`` uses
+            ``self.excluded_simplified_ecms``.
 
         Returns
         -------
@@ -1841,6 +2025,7 @@ class DataGen:
             balanced_relabel_results_df,
             target_per_relabel=target_per_relabel,
             target_relabel_ecms=target_relabel_ecms,
+            excluded_simplified_ecms=excluded_simplified_ecms,
         )
 
         export_df = self.build_curve_parameter_export_df(final_df)
@@ -1933,37 +2118,43 @@ class DataGen:
         Returns
         -------
         pathlib.Path
-            Root directory containing one subdirectory per final ECM label.
+            Root directory containing one subdirectory per final ECM label. Each
+            subdirectory contains files named ``eis_1.csv``, ``eis_2.csv``,
+            and so on.
 
         Notes
         -----
-        Each curve CSV has columns ``freq``, ``Z_img``, and ``Z_real``.
+        The output is directly compatible with ``EISDataPrep(mode="process")``:
+        ``<output_dir>/<relabel_ecm>/eis_N.csv`` with columns ``freq``,
+        ``Z_real``, and ``Z_imag``. Frequencies are written in ascending order.
         """
 
         output_dir = self.output_dir if output_dir is None else Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        for _, row in final_relabel_df.sort_values(["relabel_ecm", "global_position"]).iterrows():
-            label = str(row["relabel_ecm"])
-            safe_label = re.sub(r"[^A-Za-z0-9._-]+", "_", label).strip("_") or "unknown_ecm"
+        sorted_df = final_relabel_df.sort_values(["relabel_ecm", "global_position"])
+        freq = self.random_ecm_freq.astype(float)
+        freq_order = np.argsort(freq)
+
+        for label, label_df in sorted_df.groupby("relabel_ecm", sort=True, dropna=False):
+            label = "unknown_ecm" if pd.isna(label) else str(label)
+            safe_label = re.sub(r"[\\/]+", "_", label).strip() or "unknown_ecm"
             label_dir = output_dir / safe_label
             label_dir.mkdir(parents=True, exist_ok=True)
 
-            if use_relabel_simulation:
-                Z = np.asarray(self.simulate_relabel_impedance(row, self.random_ecm_freq))
-            else:
-                Z = np.asarray(row["Z"])
+            for eis_idx, (_, row) in enumerate(label_df.iterrows(), start=1):
+                if use_relabel_simulation:
+                    Z = np.asarray(self.simulate_relabel_impedance(row, self.random_ecm_freq))
+                else:
+                    Z = np.asarray(row["Z"])
 
-            curve_df = pd.DataFrame({
-                "freq": self.random_ecm_freq.astype(float),
-                "Z_img": np.imag(Z).astype(float),
-                "Z_real": np.real(Z).astype(float),
-            })
+                curve_df = pd.DataFrame({
+                    "freq": freq[freq_order],
+                    "Z_real": np.real(Z)[freq_order].astype(float),
+                    "Z_imag": np.imag(Z)[freq_order].astype(float),
+                })
 
-            curve_df.to_csv(
-                label_dir / f"curve_{int(row['global_position']):04d}.csv",
-                index=False,
-            )
+                curve_df.to_csv(label_dir / f"eis_{eis_idx}.csv", index=False)
 
         return output_dir
 
@@ -1979,6 +2170,7 @@ class DataGen:
         export: bool = True,
         export_plots: bool = False,
         export_dataprep: bool = False,
+        excluded_simplified_ecms: Optional[Sequence[str]] = None,
     ) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
         """Run the complete balanced generation and relabelling workflow.
 
@@ -2005,6 +2197,10 @@ class DataGen:
             Whether to write a ZIP archive of final Nyquist plots.
         export_dataprep : bool, default=False
             Whether to write AutoREC DataPrep-style curve folders.
+        excluded_simplified_ecms : sequence of str or None, optional
+            Final simplified/relabelled ECM labels to exclude. ``None`` uses
+            ``self.excluded_simplified_ecms``. Pass an empty sequence to disable
+            the default exclusions.
 
         Returns
         -------
@@ -2015,6 +2211,7 @@ class DataGen:
         balanced_df, batch_infos = self.run_balanced_relabel_dataset(
             target_per_relabel=target_per_relabel,
             target_relabel_ecms=target_relabel_ecms,
+            excluded_simplified_ecms=excluded_simplified_ecms,
             min_batches=min_batches,
             max_batches=max_batches,
             seed_start=seed_start,
@@ -2032,6 +2229,7 @@ class DataGen:
                 balanced_df,
                 target_per_relabel=target_per_relabel,
                 target_relabel_ecms=target_relabel_ecms,
+                excluded_simplified_ecms=excluded_simplified_ecms,
             )
             self._log(f"Saved table CSV: {csv_path}")
 
