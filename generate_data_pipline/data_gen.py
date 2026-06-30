@@ -37,7 +37,6 @@ import json
 import re
 import warnings
 import zipfile
-from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -71,7 +70,6 @@ DEFAULT_PARAM_BOUNDS = {
 }
 
 
-@dataclass
 class DataGen:
     """Generate, relabel, balance, and export EIS data for one source ECM.
 
@@ -130,37 +128,59 @@ class DataGen:
         Whether progress messages are printed.
     """
 
-    random_ecm_circuit: str = "R1-[P2,R3]-[P4,R5]-[P6,R7]"
-    random_ecm_freq: np.ndarray = field(default_factory=lambda: np.logspace(5, -2, 80))
-    output_dir: str | Path = "data"
-    param_bounds: Dict[str, Tuple[float, float]] = field(default_factory=lambda: dict(DEFAULT_PARAM_BOUNDS))
+    def __init__(
+        self,
+        random_ecm_circuit: str = "R1-[P2,R3]-[P4,R5]-[P6,R7]",
+        random_ecm_freq: Optional[np.ndarray] = None,
+        output_dir: str | Path = "data",
+        param_bounds: Optional[Dict[str, Tuple[float, float]]] = None,
+        n_random_candidates: int = 5000,
+        max_selected_curves: int = 100,
+        random_seed: int = 42,
+        selection_distance_threshold: Optional[float] = None,
+        high_frequency_index: int = 0,
+        max_high_frequency_minus_im_norm: float = 0.1,
+        fim_fit_ecm: bool = True,
+        fim_refit_max_iters: int = 5,
+        fim_refit_min_iters: int = 2,
+        fim_refit_max_nfev: int = 200,
+        fim_identifiability_thresh: float = 1e-6,
+        r1_value: float = 0.01,
+        drop_pp_series: bool = True,
+        drop_invalid_ecms: bool = True,
+        excluded_simplified_ecms: Optional[Sequence[str]] = ("R1", "R1-C2"),
+        validity_check_fn: Optional[Callable[[str], bool]] = default_validity_check,
+        verbose: bool = True,
+    ) -> None:
+        """Initialize the data generator and cache source-circuit helpers."""
+        self.random_ecm_circuit = random_ecm_circuit
+        self.random_ecm_freq = np.asarray(
+            np.logspace(5, -2, 80) if random_ecm_freq is None else random_ecm_freq,
+            dtype=float,
+        )
+        self.output_dir = Path(output_dir)
+        self.param_bounds = dict(DEFAULT_PARAM_BOUNDS if param_bounds is None else param_bounds)
 
-    n_random_candidates: int = 5000
-    max_selected_curves: int = 100
-    random_seed: int = 42
-    selection_distance_threshold: Optional[float] = None
+        self.n_random_candidates = n_random_candidates
+        self.max_selected_curves = max_selected_curves
+        self.random_seed = random_seed
+        self.selection_distance_threshold = selection_distance_threshold
 
-    high_frequency_index: int = 0
-    max_high_frequency_minus_im_norm: float = 0.1
+        self.high_frequency_index = high_frequency_index
+        self.max_high_frequency_minus_im_norm = max_high_frequency_minus_im_norm
 
-    fim_fit_ecm: bool = True
-    fim_refit_max_iters: int = 5
-    fim_refit_min_iters: int = 2
-    fim_refit_max_nfev: int = 200
-    fim_identifiability_thresh: float = 1e-6
+        self.fim_fit_ecm = fim_fit_ecm
+        self.fim_refit_max_iters = fim_refit_max_iters
+        self.fim_refit_min_iters = fim_refit_min_iters
+        self.fim_refit_max_nfev = fim_refit_max_nfev
+        self.fim_identifiability_thresh = fim_identifiability_thresh
 
-    r1_value: float = 0.01
-    drop_pp_series: bool = True
-    drop_invalid_ecms: bool = True
-    excluded_simplified_ecms: Optional[Sequence[str]] = ("R1", "R1-C2")
-    validity_check_fn: Optional[Callable[[str], bool]] = default_validity_check
-
-    verbose: bool = True
-
-    def __post_init__(self) -> None:
-        """Initialize paths, simplification modules, and source-circuit caches."""
-        self.random_ecm_freq = np.asarray(self.random_ecm_freq, dtype=float)
-        self.output_dir = Path(self.output_dir)
+        self.r1_value = r1_value
+        self.drop_pp_series = drop_pp_series
+        self.drop_invalid_ecms = drop_invalid_ecms
+        self.excluded_simplified_ecms = excluded_simplified_ecms
+        self.validity_check_fn = validity_check_fn
+        self.verbose = verbose
 
         self.ecm_parser_simplifier = autorec_parser
         from .ecm_simplification_functions.drop_ecm_redundancy import (
