@@ -8,7 +8,7 @@ from typing import Tuple, List, Union, Dict, Optional
 import numpy as np
 import autoeis as ae
 
-from ecm_identifiability import simplify_unidentifiable_components
+from .ecm_identifiability import simplify_unidentifiable_components
 
 
 def direct_sum(*values):

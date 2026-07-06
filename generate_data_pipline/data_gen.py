@@ -6,7 +6,7 @@ This module contains the non-PCA/non-UMAP workflow from the notebook:
 - impedance simulation
 - high-frequency filtering
 - greedy diverse-curve selection
-- simplification + FIM relabelling
+- parser full simplification and final relabelling
 - postprocessing/canonicalization
 - balanced relabel dataset generation
 - CSV / table-data export
@@ -74,9 +74,9 @@ class DataGen:
     """Generate, relabel, balance, and export EIS data for one source ECM.
 
     The class wraps the notebook workflow for random ECM parameter sampling,
-    impedance simulation, curve filtering, diverse curve selection, iterative
-    parser/FIM relabelling, canonical postprocessing, balanced row collection,
-    and export.
+    impedance simulation, curve filtering, diverse curve selection, parser
+    full simplification, final relabelling, balanced row collection, and
+    export.
 
     Parameters
     ----------
@@ -183,18 +183,19 @@ class DataGen:
         self.verbose = verbose
 
         self.ecm_parser_simplifier = autorec_parser
-        from .ecm_simplification_functions.drop_ecm_redundancy import (
-            full_simplify_redundant_circuit,
-        )
+        self.full_simplify_fn = getattr(autorec_parser, "full_simplify", None)
+        self.full_simplify_import_error = None
 
-        self.full_simplify_redundant_circuit = full_simplify_redundant_circuit
+        if self.full_simplify_fn is None:
+            try:
+                from .ecm_simplification_functions.parser import full_simplify
+
+                self.full_simplify_fn = full_simplify
+            except Exception as exc:
+                self.full_simplify_import_error = exc
 
         self.random_ecm_param_names = ae.parser.get_parameter_labels(self.random_ecm_circuit)
         self.random_ecm_fn = ae.utils.generate_circuit_fn(self.random_ecm_circuit)
-        self.max_workflow_iterations = max(
-            2,
-            len(ae.parser.get_component_labels(self.random_ecm_circuit)) + 2,
-        )
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -748,128 +749,41 @@ class DataGen:
     # ------------------------------------------------------------------
     # Relabelling and postprocessing
     # ------------------------------------------------------------------
-    @staticmethod
-    def choose_fim_relabel(
-        fim_result: Any,
-        fallback_circuit: str,
-        fallback_params: Dict[str, float],
-    ) -> Tuple[str, Optional[Dict[str, float]], Any]:
-        """Choose the circuit and parameters returned by FIM relabelling.
-
-        Parameters
-        ----------
-        fim_result : object
-            Output from ``full_simplify_redundant_circuit``. It may be a
-            circuit string, a list of circuit strings, a list of
-            ``(circuit, params)`` tuples, or an empty value.
-        fallback_circuit : str
-            Circuit used when FIM does not return a usable replacement.
-        fallback_params : dict
-            Parameters used with ``fallback_circuit``.
-
-        Returns
-        -------
-        tuple
-            Selected circuit, selected parameter dictionary if available, and
-            the original FIM candidates object.
-        """
-        if isinstance(fim_result, str):
-            return fim_result, fallback_params, []
-
-        if isinstance(fim_result, list) and fim_result:
-            first = fim_result[0]
-            if isinstance(first, tuple):
-                return first[0], first[1], fim_result
-            return first, None, fim_result
-
-        return fallback_circuit, fallback_params, fim_result
-
-    def simplify_relabel_circuit(
-        self,
-        circuit: Optional[str],
-        params: Optional[Dict[str, float]],
-    ) -> Tuple[Optional[str], Optional[Dict[str, float]]]:
-        """Simplify a relabelled circuit while preserving parameters.
-
-        Parameters
-        ----------
-        circuit : str or None
-            Circuit to simplify.
-        params : dict or None
-            Circuit parameters. When provided, simplification also recomputes
-            equivalent parameter values.
-
-        Returns
-        -------
-        tuple
-            Simplified circuit and parameters. If simplification fails, the
-            original values are returned.
-        """
-        if not circuit:
-            return circuit, params
-
-        try:
-            if isinstance(params, dict) and params:
-                simplified = self.ecm_parser_simplifier.simplify(circuit, params)
-            else:
-                simplified = self.ecm_parser_simplifier.simplify(circuit)
-
-            return simplified if isinstance(simplified, tuple) else (simplified, params)
-
-        except Exception:
-            return circuit, params
-
-    @staticmethod
-    def same_circuit(left: Optional[str], right: Optional[str]) -> bool:
-        """Compare two circuit strings while ignoring whitespace.
-
-        Parameters
-        ----------
-        left : str or None
-            First circuit.
-        right : str or None
-            Second circuit.
-
-        Returns
-        -------
-        bool
-            Whether both circuits are equivalent under whitespace removal.
-        """
-        if left is None or right is None:
-            return left is right
-
-        return re.sub(r"\s+", "", str(left)) == re.sub(r"\s+", "", str(right))
-
-    def fim_relabel_circuit(
+    def run_parser_full_simplify(
         self,
         circuit: str,
         params: Dict[str, float],
         Z: np.ndarray,
-    ) -> Tuple[str, Optional[Dict[str, float]], Any]:
-        """Run FIM redundancy analysis for one simplified circuit.
+    ) -> Tuple[str, Dict[str, float]]:
+        """Run the parser-provided full simplification for one EIS curve.
 
         Parameters
         ----------
         circuit : str
-            Simplified candidate circuit.
+            Source circuit to simplify.
         params : dict
-            Parameters for ``circuit``.
+            Source-circuit parameters.
         Z : numpy.ndarray
-            Complex impedance curve used for FIM analysis and optional refit.
+            Complex impedance curve used by parser-level FIM analysis.
 
         Returns
         -------
         tuple
-            FIM-selected circuit, selected parameters if available, and all FIM
-            candidates returned by the redundancy module.
+            Fully simplified circuit and parameter dictionary.
         """
-        fim_result = self.full_simplify_redundant_circuit(
+        if self.full_simplify_fn is None:
+            raise RuntimeError(
+                "No parser full_simplify function is available. "
+                f"Fallback import error: {self.full_simplify_import_error!r}"
+            )
+
+        return self.full_simplify_fn(
             circuit,
             self.random_ecm_freq,
             Z,
             params,
-            refit_ecm=self.fim_fit_ecm,
             identifiability_thresh=self.fim_identifiability_thresh,
+            refit_ecm=self.fim_fit_ecm,
             fit_kwargs={
                 "max_iters": self.fim_refit_max_iters,
                 "min_iters": self.fim_refit_min_iters,
@@ -877,102 +791,6 @@ class DataGen:
             },
             verbose=False,
         )
-
-        return self.choose_fim_relabel(
-            fim_result,
-            circuit,
-            params,
-        )
-
-    def simplify_fim_workflow(
-        self,
-        circuit: str,
-        params: Dict[str, float],
-        Z: np.ndarray,
-    ) -> Dict[str, Any]:
-        """Run iterative simplify/FIM relabelling for one EIS curve.
-
-        Parameters
-        ----------
-        circuit : str
-            Source circuit used as the first workflow state.
-        params : dict
-            Source-circuit parameters.
-        Z : numpy.ndarray
-            Complex impedance curve generated from the source circuit.
-
-        Returns
-        -------
-        dict
-            Relabelling metadata with the same keys consumed by
-            ``run_relabel`` and downstream postprocessing.
-
-        Notes
-        -----
-        The workflow follows ``C1 -> simplify(C2) -> FIM(C3)``. If
-        ``C1 == C2`` after at least one FIM/simplify cycle, relabelling stops.
-        If ``C2 == C3``, relabelling also stops. Otherwise ``C3`` becomes the
-        next ``C1`` and the process repeats.
-        """
-
-        current_ecm, current_params = circuit, params
-        first_simplified_ecm = circuit
-        first_simplified_params = params
-        last_fim_ecm: Optional[str] = None
-        last_fim_params: Optional[Dict[str, float]] = None
-        last_fim_candidates: Any = None
-        relabel_ecm, relabel_params = circuit, params
-        iteration = 0
-
-        for _ in range(self.max_workflow_iterations):
-            simplified_ecm, simplified_params = self.simplify_relabel_circuit(
-                current_ecm,
-                current_params,
-            )
-
-            if iteration == 0:
-                first_simplified_ecm = simplified_ecm
-                first_simplified_params = simplified_params
-
-            relabel_ecm, relabel_params = simplified_ecm, simplified_params
-
-            if self.same_circuit(current_ecm, simplified_ecm) and iteration > 0:
-                break
-
-            if not isinstance(simplified_params, dict) or not simplified_params:
-                last_fim_ecm = simplified_ecm
-                last_fim_params = simplified_params
-                break
-
-            fim_ecm, fim_params, fim_candidates = self.fim_relabel_circuit(
-                simplified_ecm,
-                simplified_params,
-                Z,
-            )
-
-            last_fim_ecm = fim_ecm
-            last_fim_params = fim_params
-            last_fim_candidates = fim_candidates
-
-            relabel_ecm, relabel_params = fim_ecm, fim_params
-
-            if self.same_circuit(simplified_ecm, fim_ecm):
-                break
-
-            current_ecm, current_params = fim_ecm, fim_params
-            iteration += 1
-
-        return {
-            "simplified_ecm": first_simplified_ecm,
-            "simplified_params": first_simplified_params,
-            "fim_relabel_ecm": last_fim_ecm or relabel_ecm,
-            "fim_relabel_params": last_fim_params if last_fim_ecm else relabel_params,
-            "post_fim_simplified_ecm": relabel_ecm,
-            "post_fim_simplified_params": relabel_params,
-            "relabel_ecm": relabel_ecm,
-            "relabel_params": relabel_params,
-            "fim_candidates": last_fim_candidates,
-        }
 
     def run_relabel(
         self,
@@ -982,7 +800,7 @@ class DataGen:
         batch_seed: Optional[int] = None,
         batch_id: Optional[int] = None,
     ) -> pd.DataFrame:
-        """Relabel selected curves with simplify/FIM workflow metadata.
+        """Relabel selected curves with parser full simplification metadata.
 
         Parameters
         ----------
@@ -1001,14 +819,15 @@ class DataGen:
         -------
         pandas.DataFrame
             One row per selected curve with original data, relabelled ECMs,
-            relabelled parameters, FIM candidates, and failure metadata.
+            relabelled parameters, parser simplification output, and failure
+            metadata.
         """
         rows = []
 
         for selected_position, (params, Z, curve) in enumerate(tqdm(
             zip(params_list, Z_list, curves),
             total=len(params_list),
-            desc="Simplify + FIM relabel selected curves",
+            desc="Parser full simplify selected curves",
         )):
             record = {
                 "batch_id": batch_id,
@@ -1032,12 +851,35 @@ class DataGen:
             }
 
             try:
-                workflow_result = self.simplify_fim_workflow(
+                simplified_ecm, simplified_params = self.run_parser_full_simplify(
                     self.random_ecm_circuit,
                     params,
                     Z,
                 )
-                record.update(workflow_result)
+
+                relabel_ecm, relabel_params = self.ensure_series_r1(
+                    simplified_ecm,
+                    simplified_params,
+                )
+                relabel_ecm = self.reorder_parallel_blocks_and_series_p(relabel_ecm)
+                relabel_ecm, mapping = self.reindex_components(relabel_ecm)
+                relabel_params = self.reindex_parameter_dict(relabel_params, mapping)
+
+                if isinstance(relabel_params, dict):
+                    relabel_params = dict(relabel_params)
+                    relabel_params["R1"] = self.r1_value
+
+                record.update({
+                    "simplified_ecm": simplified_ecm,
+                    "fim_relabel_ecm": simplified_ecm,
+                    "post_fim_simplified_ecm": simplified_ecm,
+                    "relabel_ecm": relabel_ecm,
+                    "simplified_params": simplified_params,
+                    "fim_relabel_params": simplified_params,
+                    "post_fim_simplified_params": simplified_params,
+                    "relabel_params": relabel_params,
+                    "fim_candidates": None,
+                })
 
             except Exception as exc:
                 record.update({
@@ -1507,15 +1349,14 @@ class DataGen:
         Returns
         -------
         tuple
-            Canonical circuit and parameter dictionary after capacitor
-            conversion, branch reordering, ``R1`` normalization, and reindexing.
+            Canonical circuit and parameter dictionary after ``R1``
+            normalization, branch reordering, and reindexing.
         """
         if circuit is None or pd.isna(circuit):
             return circuit, params
 
-        circuit, params = self.convert_capacitors_to_cpes(circuit, params)
-        circuit = self.reorder_parallel_blocks_and_series_p(circuit)
         circuit, params = self.ensure_series_r1(circuit, params)
+        circuit = self.reorder_parallel_blocks_and_series_p(circuit)
 
         circuit, mapping = self.reindex_components(circuit)
         params = self.reindex_parameter_dict(params, mapping)
@@ -1527,7 +1368,7 @@ class DataGen:
         return circuit, params
 
     def postprocess_relabels(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Canonicalize all relabel-related circuit and parameter columns.
+        """Canonicalize final relabel circuit and parameter columns.
 
         Parameters
         ----------
@@ -1537,15 +1378,13 @@ class DataGen:
         Returns
         -------
         pandas.DataFrame
-            Copy of ``df`` with canonicalized simplified, FIM, post-FIM, and
-            final relabel columns where present.
+            Copy of ``df`` with canonicalized final relabel columns where
+            present. Parser simplification columns are left unchanged for
+            debugging.
         """
         df = df.copy()
 
         for circuit_col, params_col in (
-            ("simplified_ecm", "simplified_params"),
-            ("fim_relabel_ecm", "fim_relabel_params"),
-            ("post_fim_simplified_ecm", "post_fim_simplified_params"),
             ("relabel_ecm", "relabel_params"),
         ):
             if circuit_col not in df.columns:

@@ -5,8 +5,8 @@ from itertools import product
 import numpy as np
 import autoeis as ae
 
-from fim_utils import compute_fim
-from eis_objectives import EISObjective
+from .fim_utils import compute_fim
+from .eis_objectives import EISObjective
 
 
 _EMPTY = object()
