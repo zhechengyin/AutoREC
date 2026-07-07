@@ -7,6 +7,7 @@ import re
 from typing import Tuple, List, Union, Dict, Optional
 import numpy as np
 import autoeis as ae
+from pprint import pprint
 
 from .ecm_identifiability import simplify_unidentifiable_components
 
@@ -368,7 +369,16 @@ def _reindex_components(
     new_circuit = pattern.sub(lambda m: mapping[m.group(1)], circuit)
 
     if params is not None:
-        new_params = {mapping.get(k, k): v for k, v in params.items()}
+        new_params = {}
+        for old_pname, val in params.items():
+            if old_pname[-1] in ["n", "w"]:
+                # P parameters
+                old_base_name = old_pname[:-1]
+                new_base_name = mapping[old_base_name]
+                new_pname = f"{new_base_name}{old_pname[-1]}"
+            else:
+                new_pname = mapping[old_pname]
+            new_params[new_pname] = val
         return new_circuit, new_params, mapping
 
     return new_circuit, mapping
@@ -468,7 +478,8 @@ def full_simplify(
                 "Simplified circuit after combining series and parallel components:",
                 simplified_circuit,
             )
-            print("Corresponding parameters:", simplified_params)
+            print("Corresponding parameters:")
+            pprint(simplified_params, sort_dicts=False)
         # Drop unidentifiable components
         if verbose:
             print("Dropping unidentifiable components...")
@@ -486,20 +497,25 @@ def full_simplify(
         )
         # Select the simplest circuit from the list of all simplified circuits
         component_counts = np.inf
+        params_counts = np.inf
         simplified_circuit = None
         simplified_params = None
         for sc, sp in all_simplified_sircuits:
-            count = len(ae.parser.get_component_labels(sc))
-            if count < component_counts:
-                component_counts = count
-                simplified_circuit = sc
-                simplified_params = sp
+            ccount = len(ae.parser.get_component_labels(sc))
+            pcount = len(ae.parser.get_parameter_labels(sc))
+            if ccount < component_counts:
+                component_counts = ccount
+                if pcount < params_counts:
+                    params_counts = pcount
+                    simplified_circuit = sc
+                    simplified_params = sp
         if verbose:
             print(
                 "Simplified circuit after removing unidentifiable components:",
                 simplified_circuit,
             )
-            print("Corresponding parameters:", simplified_params)
+            print("Corresponding parameters:")
+            pprint(simplified_params, sort_dicts=False)
         # Post-processing: Move ohmic resistors to the beginning and reindex components
         simplified_circuit, simplified_params = _move_ohmic_resistors_to_the_beginning(
             simplified_circuit, simplified_params
@@ -509,7 +525,8 @@ def full_simplify(
                 "Simplified circuit after moving ohmic resistors to the beginning:",
                 simplified_circuit,
             )
-            print("Corresponding parameters:", simplified_params)
+            print("Corresponding parameters:")
+            pprint(simplified_params, sort_dicts=False)
         simplified_circuit, simplified_params, _ = _reindex_components(
             simplified_circuit, simplified_params
         )
