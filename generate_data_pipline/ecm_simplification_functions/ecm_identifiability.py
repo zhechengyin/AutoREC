@@ -276,6 +276,7 @@ def simplify_unidentifiable_components(
     refit_ecm=True,
     fit_kwargs=None,
     verbose=False,
+    full_output=False,
 ):
     """
     Suggest unidentifiable parameters/components to drop and return the simplified circuit.
@@ -316,7 +317,7 @@ def simplify_unidentifiable_components(
         simplified_circuit string.
     """
 
-    suggestions = suggest_unidentifiable_params(
+    suggestions, eigvals, _ = suggest_unidentifiable_params(
         circuit,
         freq,
         Z,
@@ -325,13 +326,22 @@ def simplify_unidentifiable_components(
         identifiability_thresh=identifiability_thresh,
         participation_thresh=participation_thresh,
         verbose=verbose,
+        full_output=True,
     )
 
     if not suggestions:
         if verbose:
             print("No unidentifiable parameters suggested to drop.")
         if refit_ecm:
-            return [(circuit, params)]
+            params_array = np.array([val for val in params.values()])
+            chi2 = np.mean(
+                EISObjective(circuit, freq, Z, method="normalized-chi-squared")(params_array)
+            )
+            _, eigvals, _ = compute_fim(circuit, freq, Z, params_array)
+            if full_output:
+                return [(circuit, params, chi2, eigvals)]
+            else:
+                return [(circuit, params)]
         else:
             return [circuit]
 
@@ -356,20 +366,26 @@ def simplify_unidentifiable_components(
             simplified_params = ae.utils.fit_circuit_parameters(
                 simplified_circuit, freq, Z, p0, **fit_kwargs
             )
+            chi2 = np.mean(
+                EISObjective(simplified_circuit, freq, Z, method="normalized-chi-squared")(
+                    np.array([val for val in simplified_params.values()])
+                )
+            )
+
             # Compute metrics
             if verbose:
                 print("Fitted parameters:")
                 pprint(simplified_params, sort_dicts=False)
-                chi2 = np.mean(
-                    EISObjective(simplified_circuit, freq, Z, method="chi-squared")(
-                        np.array([val for val in simplified_params.values()])
-                    )
-                )
                 print(f"Chi-squared error: {chi2:.4e}")
                 print()
             # Only append if the simplified circuit is not already in the list
             if simplified_circuit not in [sc[0] for sc in simplified_circuits]:
-                simplified_circuits.append((simplified_circuit, simplified_params))
+                if full_output:
+                    simplified_circuits.append(
+                        (simplified_circuit, simplified_params, chi2, eigvals)
+                    )
+                else:
+                    simplified_circuits.append((simplified_circuit, simplified_params))
         else:
             if simplified_circuit not in simplified_circuits:
                 simplified_circuits.append(simplified_circuit)

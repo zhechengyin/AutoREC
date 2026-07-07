@@ -459,6 +459,7 @@ def full_simplify(
     Rct_to_Z_scale=0.01,
     identifiability_thresh=1e-4,
     participation_thresh=0.2,
+    chi2_thresh=1e-3,
     refit_ecm=True,
     fit_kwargs=None,
     verbose=False,
@@ -483,7 +484,7 @@ def full_simplify(
         # Drop unidentifiable components
         if verbose:
             print("Dropping unidentifiable components...")
-        all_simplified_sircuits = simplify_unidentifiable_components(
+        all_simplified_circuits = simplify_unidentifiable_components(
             simplified_circuit,
             freq,
             Z,
@@ -494,21 +495,31 @@ def full_simplify(
             refit_ecm=refit_ecm,
             fit_kwargs=fit_kwargs,
             verbose=verbose,
+            full_output=True,
         )
-        # Select the simplest circuit from the list of all simplified circuits
+        # Select the simplest circuit that still fits the data well enough
         component_counts = np.inf
         params_counts = np.inf
         simplified_circuit = None
         simplified_params = None
-        for sc, sp in all_simplified_sircuits:
-            ccount = len(ae.parser.get_component_labels(sc))
-            pcount = len(ae.parser.get_parameter_labels(sc))
-            if ccount < component_counts:
-                component_counts = ccount
-                if pcount < params_counts:
-                    params_counts = pcount
-                    simplified_circuit = sc
-                    simplified_params = sp
+        for sc, sp, chi2, eigvals in all_simplified_circuits:
+            # Note: Sometimes eigenvalues have clear small values, but chi2 is still large.
+            # With the following condition, we also do the check if this happens, not only
+            # when chi2 is small.
+            if np.min(eigvals) < identifiability_thresh or chi2 < chi2_thresh:
+                ccount = len(ae.parser.get_component_labels(sc))
+                pcount = len(ae.parser.get_parameter_labels(sc))
+                if ccount < component_counts:
+                    component_counts = ccount
+                    if pcount < params_counts:
+                        params_counts = pcount
+                        simplified_circuit = sc
+                        simplified_params = sp
+        # For safeguard, if no simplified circuit is found, keep the current one
+        if simplified_circuit is None:
+            simplified_circuit = input_circuit
+        if simplified_params is None:
+            simplified_params = params
         if verbose:
             print(
                 "Simplified circuit after removing unidentifiable components:",
