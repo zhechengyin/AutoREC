@@ -1,5 +1,6 @@
 # import jax.numpy as jnp
 import numpy as np
+from sklearn.preprocessing import StandardScaler
 from autoeis.utils import generate_circuit_fn
 
 avail_methods = [
@@ -11,6 +12,7 @@ avail_methods = [
     "log-B",
     "log-BW",
     "chi-squared",
+    "normalized-chi-squared",
     "chi-phase",
     "chi-magnitude",
 ]
@@ -19,8 +21,7 @@ avail_methods = [
 class EISObjective:
     def __init__(self, circuit, freq, Z, method="UW"):
         msg = (
-            f"Invalid method: {method}. "
-            "Use 'chi-squared', 'nyquist', 'bode', or 'magnitude'."
+            f"Invalid method: {method}. Use 'chi-squared', 'nyquist', 'bode', or 'magnitude'."
         )
         assert method in avail_methods, msg
         self.method = method
@@ -32,6 +33,10 @@ class EISObjective:
         self.Z = Z
         self.mag_gt = np.abs(Z)
         self.phase_gt = np.angle(Z)
+
+        # Normalize impedance data
+        self.scaler_real = StandardScaler().fit(Z.real.reshape(-1, 1))
+        self.scaler_imag = StandardScaler().fit(Z.imag.reshape(-1, 1))
 
     def obj_UW(self, p):
         """Computes ECM error based on the Nyquist plot."""
@@ -106,6 +111,17 @@ class EISObjective:
         weight = 1 / (self.Z.real**2 + self.Z.imag**2)
         return residual * weight
 
+    def obj_normalized_chi_squared(self, p):
+        """Computes ECM error based on normalized residual-based χ2."""
+        Z_data_real = self.scaler_real.transform(self.Z.real.reshape(-1, 1)).flatten()
+        Z_data_imag = self.scaler_imag.transform(self.Z.imag.reshape(-1, 1)).flatten()
+
+        Z_pred = self.fn(self.freq, p)
+        Z_pred_real = self.scaler_real.transform(Z_pred.real.reshape(-1, 1)).flatten()
+        Z_pred_imag = self.scaler_imag.transform(Z_pred.imag.reshape(-1, 1)).flatten()
+
+        return np.append(Z_pred_real - Z_data_real, Z_pred_imag - Z_data_imag) ** 2
+
     def obj_phase_chi(self, p):
         """Computes ECM error based on the Bode plot."""
         Z_pred = self.fn(self.freq, p)
@@ -140,6 +156,8 @@ class EISObjective:
             return self.obj_log_BW(p, *args, **kwargs)
         elif self.method == "chi-squared":
             return self.obj_chi_squared(p, *args, **kwargs)
+        elif self.method == "normalized-chi-squared":
+            return self.obj_normalized_chi_squared(p, *args, **kwargs)
         elif self.method == "chi-phase":
             return self.obj_phase_chi(p, *args, **kwargs)
         elif self.method == "chi-magnitude":
