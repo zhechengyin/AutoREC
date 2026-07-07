@@ -139,7 +139,7 @@ class DataGen:
         random_seed: int = 42,
         selection_distance_threshold: Optional[float] = None,
         high_frequency_index: int = 0,
-        max_high_frequency_minus_im_norm: float = 0.1,
+        max_high_frequency_minus_im_norm: float = 0.01,
         fim_fit_ecm: bool = True,
         fim_refit_max_iters: int = 5,
         fim_refit_min_iters: int = 2,
@@ -159,7 +159,9 @@ class DataGen:
             dtype=float,
         )
         self.output_dir = Path(output_dir)
-        self.param_bounds = dict(DEFAULT_PARAM_BOUNDS if param_bounds is None else param_bounds)
+        self.param_bounds = dict(
+            DEFAULT_PARAM_BOUNDS if param_bounds is None else param_bounds
+        )
 
         self.n_random_candidates = n_random_candidates
         self.max_selected_curves = max_selected_curves
@@ -328,8 +330,7 @@ class DataGen:
         sampled = np.atleast_2d(sampled)
 
         params_list = [
-            {name: float(value) for name, value in zip(param_names, row)}
-            for row in sampled
+            {name: float(value) for name, value in zip(param_names, row)} for row in sampled
         ]
 
         # Force generated source-circuit R1 to fixed value
@@ -382,7 +383,9 @@ class DataGen:
         im_rng = minus_im.max() - minus_im.min()
 
         re_norm = (re_part - re_part.min()) / re_rng if re_rng > 0 else np.zeros_like(re_part)
-        minus_im_norm = (minus_im - minus_im.min()) / im_rng if im_rng > 0 else np.zeros_like(minus_im)
+        minus_im_norm = (
+            (minus_im - minus_im.min()) / im_rng if im_rng > 0 else np.zeros_like(minus_im)
+        )
 
         return re_norm, minus_im_norm
 
@@ -440,11 +443,17 @@ class DataGen:
         numpy.ndarray
             Complex impedance values.
         """
-        frequencies = self.random_ecm_freq if frequencies is None else np.asarray(frequencies, dtype=float)
+        frequencies = (
+            self.random_ecm_freq
+            if frequencies is None
+            else np.asarray(frequencies, dtype=float)
+        )
         circuit_fn = ae.utils.generate_circuit_fn(circuit)
         return circuit_fn(frequencies, self.circuit_params_to_array(circuit, params))
 
-    def simulate_relabel_impedance(self, row: pd.Series, frequencies: Optional[np.ndarray] = None) -> np.ndarray:
+    def simulate_relabel_impedance(
+        self, row: pd.Series, frequencies: Optional[np.ndarray] = None
+    ) -> np.ndarray:
         """Simulate impedance using the final relabelled ECM in a result row.
 
         Parameters
@@ -484,7 +493,9 @@ class DataGen:
         tuple of numpy.ndarray
             Normalized real and ``-imaginary`` Nyquist coordinates.
         """
-        return self.normalize_curve(self.simulate_relabel_impedance(row, frequencies=frequencies))
+        return self.normalize_curve(
+            self.simulate_relabel_impedance(row, frequencies=frequencies)
+        )
 
     def simulate_candidates(
         self,
@@ -513,14 +524,20 @@ class DataGen:
             normalized Nyquist coordinates.
         """
         circuit_fn = self.random_ecm_fn if circuit_fn is None else circuit_fn
-        frequencies = self.random_ecm_freq if frequencies is None else np.asarray(frequencies, dtype=float)
+        frequencies = (
+            self.random_ecm_freq
+            if frequencies is None
+            else np.asarray(frequencies, dtype=float)
+        )
         param_names = self.random_ecm_param_names if param_names is None else list(param_names)
 
         valid_params, valid_Z, valid_curves = [], [], []
 
         for params in tqdm(params_list, desc="Simulating random candidates"):
             try:
-                Z = circuit_fn(frequencies, self.params_to_array(params, param_names=param_names))
+                Z = circuit_fn(
+                    frequencies, self.params_to_array(params, param_names=param_names)
+                )
             except Exception:
                 continue
 
@@ -538,7 +555,12 @@ class DataGen:
         curves: Sequence[Tuple[np.ndarray, np.ndarray]],
         high_freq_index: Optional[int] = None,
         max_minus_im_norm: Optional[float] = None,
-    ) -> Tuple[List[Dict[str, float]], List[np.ndarray], List[Tuple[np.ndarray, np.ndarray]], Dict[str, Any]]:
+    ) -> Tuple[
+        List[Dict[str, float]],
+        List[np.ndarray],
+        List[Tuple[np.ndarray, np.ndarray]],
+        Dict[str, Any],
+    ]:
         """Filter candidates with high-frequency ``-Im(Z)`` above a threshold.
 
         Parameters
@@ -565,7 +587,9 @@ class DataGen:
         ValueError
             If every candidate is removed.
         """
-        high_freq_index = self.high_frequency_index if high_freq_index is None else high_freq_index
+        high_freq_index = (
+            self.high_frequency_index if high_freq_index is None else high_freq_index
+        )
         max_minus_im_norm = (
             self.max_high_frequency_minus_im_norm
             if max_minus_im_norm is None
@@ -612,7 +636,9 @@ class DataGen:
         return np.stack([np.column_stack(curve) for curve in curves]).astype(np.float32)
 
     @staticmethod
-    def mean_curve_distance(curve_points: np.ndarray, reference_curve: np.ndarray) -> np.ndarray:
+    def mean_curve_distance(
+        curve_points: np.ndarray, reference_curve: np.ndarray
+    ) -> np.ndarray:
         """Compute mean pointwise distance from each curve to a reference.
 
         Parameters
@@ -636,7 +662,13 @@ class DataGen:
         curves: Sequence[Tuple[np.ndarray, np.ndarray]],
         k: Optional[int] = None,
         min_distance: Optional[float] = None,
-    ) -> Tuple[List[Dict[str, float]], List[np.ndarray], List[Tuple[np.ndarray, np.ndarray]], List[int], List[float]]:
+    ) -> Tuple[
+        List[Dict[str, float]],
+        List[np.ndarray],
+        List[Tuple[np.ndarray, np.ndarray]],
+        List[int],
+        List[float],
+    ]:
         """Select a diverse subset of normalized curves greedily.
 
         Parameters
@@ -659,13 +691,17 @@ class DataGen:
             filtered indices, and greedy distance scores.
         """
         k = self.max_selected_curves if k is None else k
-        min_distance = self.selection_distance_threshold if min_distance is None else min_distance
+        min_distance = (
+            self.selection_distance_threshold if min_distance is None else min_distance
+        )
 
         if not curves or k <= 0:
             return [], [], [], [], []
 
         curve_points = self.stack_curves(curves)
-        first = int(np.argmax(self.mean_curve_distance(curve_points, curve_points.mean(axis=0))))
+        first = int(
+            np.argmax(self.mean_curve_distance(curve_points, curve_points.mean(axis=0)))
+        )
 
         selected, scores = [first], [np.inf]
         min_dist = self.mean_curve_distance(curve_points, curve_points[first])
@@ -680,7 +716,9 @@ class DataGen:
             selected.append(nxt)
             scores.append(score)
 
-            min_dist = np.minimum(min_dist, self.mean_curve_distance(curve_points, curve_points[nxt]))
+            min_dist = np.minimum(
+                min_dist, self.mean_curve_distance(curve_points, curve_points[nxt])
+            )
             min_dist[selected] = -np.inf
 
         return (
@@ -723,11 +761,13 @@ class DataGen:
             curves,
         )
 
-        selected_params, selected_Z, selected_curves, selected_idx, selected_scores = self.greedy_select(
-            filtered_params,
-            filtered_Z,
-            filtered_curves,
-            k=max_selected_curves,
+        selected_params, selected_Z, selected_curves, selected_idx, selected_scores = (
+            self.greedy_select(
+                filtered_params,
+                filtered_Z,
+                filtered_curves,
+                k=max_selected_curves,
+            )
         )
 
         return {
@@ -754,6 +794,7 @@ class DataGen:
         circuit: str,
         params: Dict[str, float],
         Z: np.ndarray,
+        verbose: bool = False,
     ) -> Tuple[str, Dict[str, float]]:
         """Run the parser-provided full simplification for one EIS curve.
 
@@ -789,7 +830,7 @@ class DataGen:
                 "min_iters": self.fim_refit_min_iters,
                 "max_nfev": self.fim_refit_max_nfev,
             },
-            verbose=False,
+            verbose=verbose,
         )
 
     def run_relabel(
@@ -824,11 +865,13 @@ class DataGen:
         """
         rows = []
 
-        for selected_position, (params, Z, curve) in enumerate(tqdm(
-            zip(params_list, Z_list, curves),
-            total=len(params_list),
-            desc="Parser full simplify selected curves",
-        )):
+        for selected_position, (params, Z, curve) in enumerate(
+            tqdm(
+                zip(params_list, Z_list, curves),
+                total=len(params_list),
+                desc="Parser full simplify selected curves",
+            )
+        ):
             record = {
                 "batch_id": batch_id,
                 "batch_seed": batch_seed,
@@ -858,38 +901,40 @@ class DataGen:
                 )
 
                 relabel_ecm, relabel_params = self.ensure_series_r1(
-                    simplified_ecm,
-                    simplified_params,
+                    simplified_ecm, simplified_params
+                )
+                relabel_ecm, relabel_params = self.convert_capacitors_to_cpes(
+                    relabel_ecm, relabel_params
                 )
                 relabel_ecm = self.reorder_parallel_blocks_and_series_p(relabel_ecm)
                 relabel_ecm, mapping = self.reindex_components(relabel_ecm)
                 relabel_params = self.reindex_parameter_dict(relabel_params, mapping)
 
-                if isinstance(relabel_params, dict):
-                    relabel_params = dict(relabel_params)
-                    relabel_params["R1"] = self.r1_value
-
-                record.update({
-                    "simplified_ecm": simplified_ecm,
-                    "fim_relabel_ecm": simplified_ecm,
-                    "post_fim_simplified_ecm": simplified_ecm,
-                    "relabel_ecm": relabel_ecm,
-                    "simplified_params": simplified_params,
-                    "fim_relabel_params": simplified_params,
-                    "post_fim_simplified_params": simplified_params,
-                    "relabel_params": relabel_params,
-                    "fim_candidates": None,
-                })
+                record.update(
+                    {
+                        "simplified_ecm": simplified_ecm,
+                        "fim_relabel_ecm": simplified_ecm,
+                        "post_fim_simplified_ecm": simplified_ecm,
+                        "relabel_ecm": relabel_ecm,
+                        "simplified_params": simplified_params,
+                        "fim_relabel_params": simplified_params,
+                        "post_fim_simplified_params": simplified_params,
+                        "relabel_params": relabel_params,
+                        "fim_candidates": None,
+                    }
+                )
 
             except Exception as exc:
-                record.update({
-                    "simplified_ecm": self.random_ecm_circuit,
-                    "fim_relabel_ecm": self.random_ecm_circuit,
-                    "post_fim_simplified_ecm": self.random_ecm_circuit,
-                    "relabel_ecm": self.random_ecm_circuit,
-                    "relabel_failed": True,
-                    "failure_reason": repr(exc),
-                })
+                record.update(
+                    {
+                        "simplified_ecm": self.random_ecm_circuit,
+                        "fim_relabel_ecm": self.random_ecm_circuit,
+                        "post_fim_simplified_ecm": self.random_ecm_circuit,
+                        "relabel_ecm": self.random_ecm_circuit,
+                        "relabel_failed": True,
+                        "failure_reason": repr(exc),
+                    }
+                )
 
             rows.append(record)
 
@@ -1092,7 +1137,9 @@ class DataGen:
             return df.reset_index(drop=True)
 
         df = df.copy()
-        excluded_mask = df[circuit_col].apply(lambda circuit: self.circuit_key(circuit) in excluded_keys)
+        excluded_mask = df[circuit_col].apply(
+            lambda circuit: self.circuit_key(circuit) in excluded_keys
+        )
 
         self._log(f"Dropping {int(excluded_mask.sum())} excluded simplified ECMs")
         self._log(f"Keeping {int((~excluded_mask).sum())} rows after simplified ECM exclusion")
@@ -1132,7 +1179,7 @@ class DataGen:
                 depth -= circuit[i] == "]"
                 i += 1
 
-            items = self.split_top_level(circuit[start + 1:i - 1])
+            items = self.split_top_level(circuit[start + 1 : i - 1])
             items = [self.reorder_parallel_blocks_and_series_p(item) for item in items]
             items = sorted(items, key=self._parallel_sort_key)
             out.append("[" + ",".join(items) + "]")
@@ -1140,14 +1187,8 @@ class DataGen:
         circuit = "".join(out)
         series_parts = self.split_top_level(circuit, sep="-")
 
-        p_parts = [
-            part for part in series_parts
-            if re.fullmatch(r"\s*P\d+\s*", part)
-        ]
-        non_p_parts = [
-            part for part in series_parts
-            if not re.fullmatch(r"\s*P\d+\s*", part)
-        ]
+        p_parts = [part for part in series_parts if re.fullmatch(r"\s*P\d+\s*", part)]
+        non_p_parts = [part for part in series_parts if not re.fullmatch(r"\s*P\d+\s*", part)]
 
         return "-".join(non_p_parts + p_parts)
 
@@ -1179,7 +1220,7 @@ class DataGen:
         if not isinstance(params, dict):
             return circuit, params
 
-        converted = {}
+        converted_params = {}
 
         for key, value in params.items():
             key = str(key)
@@ -1187,12 +1228,12 @@ class DataGen:
 
             if match:
                 cpe_base = f"P{match.group(1)}"
-                converted[f"{cpe_base}w"] = value
-                converted[f"{cpe_base}n"] = 1.0
+                converted_params[f"{cpe_base}w"] = value
+                converted_params[f"{cpe_base}n"] = 1.0
             else:
-                converted[key] = value
+                converted_params[key] = value
 
-        return circuit, converted
+        return circuit, converted_params
 
     def ensure_series_r1(
         self,
@@ -1384,9 +1425,7 @@ class DataGen:
         """
         df = df.copy()
 
-        for circuit_col, params_col in (
-            ("relabel_ecm", "relabel_params"),
-        ):
+        for circuit_col, params_col in (("relabel_ecm", "relabel_params"),):
             if circuit_col not in df.columns:
                 continue
 
@@ -1409,7 +1448,9 @@ class DataGen:
     # Balanced dataset generation
     # ------------------------------------------------------------------
     @staticmethod
-    def relabel_group_counts(df: pd.DataFrame, target_labels: Optional[Sequence[str]] = None) -> pd.Series:
+    def relabel_group_counts(
+        df: pd.DataFrame, target_labels: Optional[Sequence[str]] = None
+    ) -> pd.Series:
         """Count valid rows per final relabelled ECM.
 
         Parameters
@@ -1466,8 +1507,12 @@ class DataGen:
         tuple
             Batch result DataFrame and batch metadata dictionary.
         """
-        n_random_candidates = self.n_random_candidates if n_random_candidates is None else n_random_candidates
-        max_selected_curves = self.max_selected_curves if max_selected_curves is None else max_selected_curves
+        n_random_candidates = (
+            self.n_random_candidates if n_random_candidates is None else n_random_candidates
+        )
+        max_selected_curves = (
+            self.max_selected_curves if max_selected_curves is None else max_selected_curves
+        )
 
         candidates = self.sample_params(
             n_candidates=n_random_candidates,
@@ -1482,11 +1527,13 @@ class DataGen:
             curves,
         )
 
-        selected_params, selected_Z, selected_curves, selected_idx, selected_scores = self.greedy_select(
-            filtered_params,
-            filtered_Z,
-            filtered_curves,
-            k=max_selected_curves,
+        selected_params, selected_Z, selected_curves, selected_idx, selected_scores = (
+            self.greedy_select(
+                filtered_params,
+                filtered_Z,
+                filtered_curves,
+                k=max_selected_curves,
+            )
         )
 
         batch_df = self.run_relabel(
@@ -1505,7 +1552,9 @@ class DataGen:
             excluded_simplified_ecms=excluded_simplified_ecms,
             circuit_col="relabel_ecm",
         )
-        removed_by_excluded_simplified_ecm_filter = before_excluded_filter_count - len(batch_df)
+        removed_by_excluded_simplified_ecm_filter = before_excluded_filter_count - len(
+            batch_df
+        )
 
         if self.drop_pp_series:
             batch_df = self.drop_series_p_chain_after_relabel(
@@ -1640,6 +1689,7 @@ class DataGen:
         excluded_keys = self.excluded_simplified_ecm_keys(excluded_simplified_ecms)
 
         if target_labels is not None and excluded_keys:
+
             def target_exclusion_keys(label: str) -> set[str]:
                 """Return raw and canonical exclusion-comparison keys for a target label."""
                 keys = set()
@@ -1773,8 +1823,7 @@ class DataGen:
         )
 
         final_df = (
-            source_df
-            .sort_values(["relabel_ecm", "batch_id", "selected_position"])
+            source_df.sort_values(["relabel_ecm", "batch_id", "selected_position"])
             .groupby("relabel_ecm", group_keys=False)
             .head(target_per_relabel)
             .reset_index(drop=True)
@@ -1786,7 +1835,9 @@ class DataGen:
         missing = final_counts[final_counts < target_per_relabel]
 
         if not missing.empty:
-            raise RuntimeError(f"Final balanced export still has under-target groups:\n{missing.to_string()}")
+            raise RuntimeError(
+                f"Final balanced export still has under-target groups:\n{missing.to_string()}"
+            )
 
         return final_df
 
@@ -1808,7 +1859,9 @@ class DataGen:
         frequency_json = json.dumps([float(value) for value in self.random_ecm_freq])
         rows = []
 
-        for _, row in final_relabel_df.sort_values(["relabel_ecm", "global_position"]).iterrows():
+        for _, row in final_relabel_df.sort_values(
+            ["relabel_ecm", "global_position"]
+        ).iterrows():
             original_params = (
                 {str(k): float(v) for k, v in row["params"].items()}
                 if isinstance(row["params"], dict)
@@ -1822,17 +1875,21 @@ class DataGen:
 
             Z = np.asarray(row["Z"])
 
-            rows.append({
-                "original_ecm": row["original_ecm"],
-                "original_params_json": json.dumps(original_params, sort_keys=True),
-                "final_simplified_ecm": row["relabel_ecm"],
-                "final_simplified_params_json": json.dumps(relabel_params, sort_keys=True),
-                "frequency_hz_json": frequency_json,
-                "impedance_data_json": json.dumps({
-                    "real_ohm": [float(value) for value in np.real(Z)],
-                    "imag_ohm": [float(value) for value in np.imag(Z)],
-                }),
-            })
+            rows.append(
+                {
+                    "original_ecm": row["original_ecm"],
+                    "original_params_json": json.dumps(original_params, sort_keys=True),
+                    "final_simplified_ecm": row["relabel_ecm"],
+                    "final_simplified_params_json": json.dumps(relabel_params, sort_keys=True),
+                    "frequency_hz_json": frequency_json,
+                    "impedance_data_json": json.dumps(
+                        {
+                            "real_ohm": [float(value) for value in np.real(Z)],
+                            "imag_ohm": [float(value) for value in np.imag(Z)],
+                        }
+                    ),
+                }
+            )
 
         return pd.DataFrame(rows)
 
@@ -1917,10 +1974,14 @@ class DataGen:
         zip_path.parent.mkdir(parents=True, exist_ok=True)
 
         with zipfile.ZipFile(zip_path, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for _, row in final_relabel_df.sort_values(["relabel_ecm", "global_position"]).iterrows():
+            for _, row in final_relabel_df.sort_values(
+                ["relabel_ecm", "global_position"]
+            ).iterrows():
                 Z = np.asarray(self.simulate_relabel_impedance(row, self.random_ecm_freq))
                 label = str(row["relabel_ecm"])
-                safe_label = re.sub(r"[^A-Za-z0-9._-]+", "_", label).strip("_") or "unknown_ecm"
+                safe_label = (
+                    re.sub(r"[^A-Za-z0-9._-]+", "_", label).strip("_") or "unknown_ecm"
+                )
 
                 fig, ax = plt.subplots(figsize=(5.8, 5.2))
                 ax.plot(np.real(Z), -np.imag(Z), linewidth=1.8)
@@ -1993,11 +2054,13 @@ class DataGen:
                 else:
                     Z = np.asarray(row["Z"])
 
-                curve_df = pd.DataFrame({
-                    "freq": freq[freq_order],
-                    "Z_real": np.real(Z)[freq_order].astype(float),
-                    "Z_imag": np.imag(Z)[freq_order].astype(float),
-                })
+                curve_df = pd.DataFrame(
+                    {
+                        "freq": freq[freq_order],
+                        "Z_real": np.real(Z)[freq_order].astype(float),
+                        "Z_imag": np.imag(Z)[freq_order].astype(float),
+                    }
+                )
 
                 curve_df.to_csv(label_dir / f"eis_{eis_idx}.csv", index=False)
 
