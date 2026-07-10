@@ -35,11 +35,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 import warnings
 import zipfile
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import autoeis as ae
 import numpy as np
@@ -662,6 +663,7 @@ class DataGen:
         curves: Sequence[Tuple[np.ndarray, np.ndarray]],
         k: Optional[int] = None,
         min_distance: Optional[float] = None,
+        reference_curves: Optional[Sequence[Tuple[np.ndarray, np.ndarray]]] = None,
     ) -> Tuple[
         List[Dict[str, float]],
         List[np.ndarray],
@@ -683,6 +685,10 @@ class DataGen:
             Maximum number of curves to select.
         min_distance : float, optional
             Stop selection when the next best curve is closer than this value.
+        reference_curves : sequence of tuple, optional
+            Previously kept normalized Nyquist curves. When provided, candidates
+            are selected by maximizing their minimum distance to both these
+            references and the curves already selected in the current batch.
 
         Returns
         -------
@@ -699,12 +705,27 @@ class DataGen:
             return [], [], [], [], []
 
         curve_points = self.stack_curves(curves)
-        first = int(
-            np.argmax(self.mean_curve_distance(curve_points, curve_points.mean(axis=0)))
-        )
+        reference_curves = [] if reference_curves is None else list(reference_curves)
 
-        selected, scores = [first], [np.inf]
-        min_dist = self.mean_curve_distance(curve_points, curve_points[first])
+        if reference_curves:
+            reference_points = self.stack_curves(reference_curves)
+            reference_distances = [
+                self.mean_curve_distance(curve_points, reference_curve)
+                for reference_curve in reference_points
+            ]
+            min_dist = np.min(np.stack(reference_distances), axis=0)
+            first, first_score = int(np.argmax(min_dist)), float(np.max(min_dist))
+
+            if min_distance is not None and first_score < min_distance:
+                return [], [], [], [], []
+        else:
+            first = int(
+                np.argmax(self.mean_curve_distance(curve_points, curve_points.mean(axis=0)))
+            )
+            first_score = np.inf
+            min_dist = self.mean_curve_distance(curve_points, curve_points[first])
+
+        selected, scores = [first], [first_score]
         min_dist[first] = -np.inf
 
         while len(selected) < min(k, len(curves)):
@@ -734,6 +755,7 @@ class DataGen:
         seed: Optional[int] = None,
         n_random_candidates: Optional[int] = None,
         max_selected_curves: Optional[int] = None,
+        reference_curves: Optional[Sequence[Tuple[np.ndarray, np.ndarray]]] = None,
     ) -> Dict[str, Any]:
         """Run sampling, simulation, high-frequency filtering, and selection.
 
@@ -745,6 +767,9 @@ class DataGen:
             Number of random samples to generate.
         max_selected_curves : int, optional
             Maximum number of curves selected after filtering.
+        reference_curves : sequence of tuple, optional
+            Previously kept normalized Nyquist curves used as diversity
+            references during greedy selection.
 
         Returns
         -------
@@ -767,6 +792,7 @@ class DataGen:
                 filtered_Z,
                 filtered_curves,
                 k=max_selected_curves,
+                reference_curves=reference_curves,
             )
         )
 
@@ -1478,6 +1504,41 @@ class DataGen:
 
         return counts
 
+    @staticmethod
+    def target_count_series(
+        target_per_relabel: int | Mapping[str, int],
+        target_labels: Sequence[str],
+    ) -> pd.Series:
+        """Build per-label target counts from a scalar or explicit mapping.
+
+        Parameters
+        ----------
+        target_per_relabel : int or mapping
+            Uniform count for every label, or explicit count by relabelled ECM.
+        target_labels : sequence of str
+            Labels that must have target counts.
+
+        Returns
+        -------
+        pandas.Series
+            Target counts indexed by relabelled ECM label.
+        """
+        labels = list(target_labels)
+
+        if isinstance(target_per_relabel, Mapping):
+            missing = [label for label in labels if label not in target_per_relabel]
+            if missing:
+                raise ValueError(
+                    "target_per_relabel is missing target count(s) for "
+                    f"label(s): {missing}"
+                )
+            return pd.Series(
+                {label: int(target_per_relabel[label]) for label in labels},
+                dtype=int,
+            )
+
+        return pd.Series(int(target_per_relabel), index=labels, dtype=int)
+
     def run_selected_relabel_batch(
         self,
         seed: int,
@@ -1485,6 +1546,7 @@ class DataGen:
         n_random_candidates: Optional[int] = None,
         max_selected_curves: Optional[int] = None,
         excluded_simplified_ecms: Optional[Sequence[str]] = None,
+        reference_curves: Optional[Sequence[Tuple[np.ndarray, np.ndarray]]] = None,
     ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         """Generate, select, relabel, and filter one random batch.
 
@@ -1501,6 +1563,9 @@ class DataGen:
         excluded_simplified_ecms : sequence of str or None, optional
             Final simplified/relabelled ECM labels to exclude. ``None`` uses
             ``self.excluded_simplified_ecms``.
+        reference_curves : sequence of tuple, optional
+            Previously kept normalized Nyquist curves used as diversity
+            references during greedy selection.
 
         Returns
         -------
@@ -1533,6 +1598,7 @@ class DataGen:
                 filtered_Z,
                 filtered_curves,
                 k=max_selected_curves,
+                reference_curves=reference_curves,
             )
         )
 
@@ -1582,6 +1648,7 @@ class DataGen:
             "valid_candidate_count": len(params),
             "filtered_candidate_count": len(filtered_params),
             "selected_curve_count": len(selected_curves),
+            "reference_curve_count": 0 if reference_curves is None else len(reference_curves),
             "after_final_filters_count": len(batch_df),
             "removed_by_high_frequency_filter": filter_info["removed_candidate_count"],
             "removed_by_excluded_simplified_ecm_filter": removed_by_excluded_simplified_ecm_filter,
@@ -1594,7 +1661,7 @@ class DataGen:
         batch_df: pd.DataFrame,
         counts: pd.Series,
         target_labels: Sequence[str],
-        target_per_relabel: int,
+        target_per_relabel: int | Mapping[str, int],
     ) -> Tuple[pd.DataFrame, pd.Series]:
         """Keep only rows still needed to meet target counts.
 
@@ -1606,7 +1673,7 @@ class DataGen:
             Current accumulated count per target label. Updated in place.
         target_labels : sequence of str
             Final ECM labels being balanced.
-        target_per_relabel : int
+        target_per_relabel : int or mapping
             Desired number of rows per target label.
 
         Returns
@@ -1621,8 +1688,10 @@ class DataGen:
         if "relabel_failed" in usable.columns:
             usable = usable.loc[~usable["relabel_failed"]]
 
+        target_counts = self.target_count_series(target_per_relabel, target_labels)
+
         for label in target_labels:
-            needed = target_per_relabel - int(counts.get(label, 0))
+            needed = int(target_counts[label]) - int(counts.get(label, 0))
 
             if needed <= 0:
                 continue
@@ -1641,7 +1710,7 @@ class DataGen:
 
     def run_balanced_relabel_dataset(
         self,
-        target_per_relabel: int = 5,
+        target_per_relabel: int | Mapping[str, int] = 5,
         target_relabel_ecms: Optional[Sequence[str]] = None,
         min_batches: int = 1,
         max_batches: int = 200,
@@ -1654,8 +1723,9 @@ class DataGen:
 
         Parameters
         ----------
-        target_per_relabel : int, default=5
-            Desired number of rows per final relabelled ECM.
+        target_per_relabel : int or mapping, default=5
+            Desired number of rows per final relabelled ECM. Pass a mapping
+            from final relabelled ECM to count for non-uniform targets.
         target_relabel_ecms : sequence of str, optional
             Explicit target labels. If omitted, labels discovered in the first
             batch define the balancing target set.
@@ -1684,8 +1754,16 @@ class DataGen:
             If the requested balance target is not reached within
             ``max_batches``.
         """
-        use_manual_targets = target_relabel_ecms is not None
-        target_labels = sorted(set(target_relabel_ecms)) if use_manual_targets else None
+        use_explicit_target_counts = isinstance(target_per_relabel, Mapping)
+        use_manual_targets = (
+            target_relabel_ecms is not None or use_explicit_target_counts
+        )
+        if target_relabel_ecms is not None:
+            target_labels = list(dict.fromkeys(target_relabel_ecms))
+        elif use_explicit_target_counts:
+            target_labels = list(target_per_relabel)
+        else:
+            target_labels = None
         excluded_keys = self.excluded_simplified_ecm_keys(excluded_simplified_ecms)
 
         if target_labels is not None and excluded_keys:
@@ -1720,6 +1798,7 @@ class DataGen:
                 )
 
         kept_batches = []
+        kept_reference_curves = []
         batch_infos = []
         counts = pd.Series(dtype=int)
 
@@ -1732,6 +1811,7 @@ class DataGen:
                 n_random_candidates=n_random_candidates,
                 max_selected_curves=max_selected_curves,
                 excluded_simplified_ecms=excluded_simplified_ecms,
+                reference_curves=kept_reference_curves,
             )
             batch_infos.append(batch_info)
 
@@ -1743,6 +1823,7 @@ class DataGen:
             elif counts.empty:
                 counts = pd.Series(0, index=target_labels, dtype=int)
 
+            target_counts = self.target_count_series(target_per_relabel, target_labels)
             before_counts = counts.copy()
 
             kept_df, counts = self.take_needed_target_rows(
@@ -1754,9 +1835,10 @@ class DataGen:
 
             if not kept_df.empty:
                 kept_batches.append(kept_df)
+                kept_reference_curves.extend(kept_df["curve"].tolist())
 
             added_counts = counts.subtract(before_counts, fill_value=0).astype(int)
-            under_target = counts[counts < target_per_relabel]
+            under_target = counts[counts < target_counts]
             target_note = "manual target" if use_manual_targets else "first-batch target"
 
             self._log(
@@ -1772,8 +1854,9 @@ class DataGen:
                 return pd.concat(kept_batches, ignore_index=True), batch_infos
 
         raise RuntimeError(
-            f"Balanced relabel dataset did not reach {target_per_relabel} per group "
-            f"within {max_batches} batches. Current counts:\n{counts.to_string()}"
+            "Balanced relabel dataset did not reach target counts within "
+            f"{max_batches} batches. Target counts:\n{target_counts.to_string()}\n"
+            f"Current counts:\n{counts.to_string()}"
         )
 
     # ------------------------------------------------------------------
@@ -1782,7 +1865,7 @@ class DataGen:
     def build_final_relabel_df(
         self,
         balanced_relabel_results_df: pd.DataFrame,
-        target_per_relabel: int,
+        target_per_relabel: int | Mapping[str, int],
         target_relabel_ecms: Optional[Sequence[str]] = None,
         excluded_simplified_ecms: Optional[Sequence[str]] = None,
     ) -> pd.DataFrame:
@@ -1792,7 +1875,7 @@ class DataGen:
         ----------
         balanced_relabel_results_df : pandas.DataFrame
             Accumulated balanced relabel results.
-        target_per_relabel : int
+        target_per_relabel : int or mapping
             Number of rows to keep per final relabelled ECM.
         target_relabel_ecms : sequence of str, optional
             Optional final label filter.
@@ -1822,17 +1905,27 @@ class DataGen:
             circuit_col="relabel_ecm",
         )
 
-        final_df = (
-            source_df.sort_values(["relabel_ecm", "batch_id", "selected_position"])
-            .groupby("relabel_ecm", group_keys=False)
-            .head(target_per_relabel)
-            .reset_index(drop=True)
-        )
+        if target_relabel_ecms is not None:
+            target_labels = list(dict.fromkeys(target_relabel_ecms))
+        elif isinstance(target_per_relabel, Mapping):
+            target_labels = list(target_per_relabel)
+            source_df = source_df.loc[source_df["relabel_ecm"].isin(target_labels)]
+        else:
+            target_labels = sorted(source_df["relabel_ecm"].dropna().unique())
+
+        target_counts = self.target_count_series(target_per_relabel, target_labels)
+        sorted_df = source_df.sort_values(["relabel_ecm", "batch_id", "selected_position"])
+        final_parts = [
+            sorted_df.loc[sorted_df["relabel_ecm"] == label].head(int(target_counts[label]))
+            for label in target_labels
+        ]
+        final_df = pd.concat(final_parts, ignore_index=True) if final_parts else sorted_df.iloc[0:0].copy()
 
         final_df.insert(0, "global_position", np.arange(len(final_df)))
 
-        final_counts = self.relabel_group_counts(final_df)
-        missing = final_counts[final_counts < target_per_relabel]
+        final_counts = self.relabel_group_counts(final_df, target_labels=target_labels)
+        missing = target_counts.subtract(final_counts, fill_value=0)
+        missing = missing[missing > 0]
 
         if not missing.empty:
             raise RuntimeError(
@@ -1896,7 +1989,7 @@ class DataGen:
     def export_table_csv(
         self,
         balanced_relabel_results_df: pd.DataFrame,
-        target_per_relabel: int = 5,
+        target_per_relabel: int | Mapping[str, int] = 5,
         target_relabel_ecms: Optional[Sequence[str]] = None,
         csv_path: Optional[str | Path] = None,
         excluded_simplified_ecms: Optional[Sequence[str]] = None,
@@ -1907,7 +2000,7 @@ class DataGen:
         ----------
         balanced_relabel_results_df : pandas.DataFrame
             Balanced relabel results before final trimming.
-        target_per_relabel : int, default=5
+        target_per_relabel : int or mapping, default=5
             Number of rows to keep per final relabelled ECM.
         target_relabel_ecms : sequence of str, optional
             Optional final label filter.
@@ -2003,6 +2096,62 @@ class DataGen:
 
         return zip_path
 
+    def export_eis_plot_folder(
+        self,
+        final_relabel_df: pd.DataFrame,
+        output_dir: Optional[str | Path] = None,
+    ) -> Path:
+        """Export one Nyquist plot PNG per final relabelled row.
+
+        Parameters
+        ----------
+        final_relabel_df : pandas.DataFrame
+            Final rows containing ``relabel_ecm`` and ``relabel_params``.
+        output_dir : str or pathlib.Path, optional
+            Destination directory. Defaults to a source-ECM-derived plot
+            directory in ``self.output_dir``.
+
+        Returns
+        -------
+        pathlib.Path
+            Directory containing one PNG file per generated EIS curve.
+        """
+        import matplotlib.pyplot as plt
+
+        if output_dir is None:
+            slug = self.source_ecm_filename_slug(self.random_ecm_circuit)
+            output_dir = self.output_dir / f"eis_plots_{slug}"
+        else:
+            output_dir = Path(output_dir)
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for old_png in output_dir.glob("*.png"):
+            old_png.unlink()
+
+        for _, row in final_relabel_df.sort_values(["relabel_ecm", "global_position"]).iterrows():
+            Z = np.asarray(self.simulate_relabel_impedance(row, self.random_ecm_freq))
+            label = str(row["relabel_ecm"])
+            safe_label = (
+                re.sub(r"[^A-Za-z0-9._-]+", "_", label).strip("_") or "unknown_ecm"
+            )
+
+            fig, ax = plt.subplots(figsize=(5.8, 5.2))
+            ax.plot(np.real(Z), -np.imag(Z), linewidth=1.8)
+            ax.set_title(label, fontsize=10, wrap=True)
+            ax.set_xlabel("Re(Z) / ohm")
+            ax.set_ylabel("-Im(Z) / ohm")
+            ax.grid(True, linestyle=":", alpha=0.35)
+            ax.set_aspect("equal", adjustable="datalim")
+            fig.tight_layout()
+            fig.savefig(
+                output_dir / f"eis_{int(row['global_position']):04d}_{safe_label}.png",
+                dpi=180,
+                bbox_inches="tight",
+            )
+            plt.close(fig)
+
+        return output_dir
+
     def export_dataprep_folder(
         self,
         final_relabel_df: pd.DataFrame,
@@ -2047,6 +2196,8 @@ class DataGen:
             safe_label = re.sub(r"[\\/]+", "_", label).strip() or "unknown_ecm"
             label_dir = output_dir / safe_label
             label_dir.mkdir(parents=True, exist_ok=True)
+            for old_csv in label_dir.glob("eis_*.csv"):
+                old_csv.unlink()
 
             for eis_idx, (_, row) in enumerate(label_df.iterrows(), start=1):
                 if use_relabel_simulation:
@@ -2066,9 +2217,82 @@ class DataGen:
 
         return output_dir
 
+    def export_eis_data_folder(
+        self,
+        final_relabel_df: pd.DataFrame,
+        output_dir: Optional[str | Path] = None,
+        use_relabel_simulation: bool = True,
+    ) -> Path:
+        """Export generated EIS data as per-ECM CSV and PNG folders.
+
+        Parameters
+        ----------
+        final_relabel_df : pandas.DataFrame
+            Final rows containing relabelled ECM metadata and impedance data.
+        output_dir : str or pathlib.Path, optional
+            Root output directory. Defaults to ``self.output_dir``.
+        use_relabel_simulation : bool, default=True
+            If ``True``, regenerate impedance from final relabelled ECMs.
+            Otherwise write and plot the original stored ``Z`` values.
+
+        Returns
+        -------
+        pathlib.Path
+            Root directory with ``<relabel_ecm>/csv/eis_N.csv`` and
+            ``<relabel_ecm>/png/eis_N.png`` for each generated curve.
+        """
+        import matplotlib.pyplot as plt
+
+        output_dir = self.output_dir if output_dir is None else Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        sorted_df = final_relabel_df.sort_values(["relabel_ecm", "global_position"])
+        freq = self.random_ecm_freq.astype(float)
+        freq_order = np.argsort(freq)
+
+        for label, label_df in sorted_df.groupby("relabel_ecm", sort=True, dropna=False):
+            label = "unknown_ecm" if pd.isna(label) else str(label)
+            safe_label = re.sub(r"[\\/]+", "_", label).strip() or "unknown_ecm"
+            label_dir = output_dir / safe_label
+            if label_dir.exists():
+                shutil.rmtree(label_dir)
+
+            csv_dir = label_dir / "csv"
+            png_dir = label_dir / "png"
+            csv_dir.mkdir(parents=True, exist_ok=True)
+            png_dir.mkdir(parents=True, exist_ok=True)
+
+            for eis_idx, (_, row) in enumerate(label_df.iterrows(), start=1):
+                if use_relabel_simulation:
+                    Z = np.asarray(self.simulate_relabel_impedance(row, self.random_ecm_freq))
+                else:
+                    Z = np.asarray(row["Z"])
+
+                curve_df = pd.DataFrame(
+                    {
+                        "freq": freq[freq_order],
+                        "Z_real": np.real(Z)[freq_order].astype(float),
+                        "Z_imag": np.imag(Z)[freq_order].astype(float),
+                    }
+                )
+                curve_df.to_csv(csv_dir / f"eis_{eis_idx}.csv", index=False)
+
+                fig, ax = plt.subplots(figsize=(5.8, 5.2))
+                ax.plot(np.real(Z), -np.imag(Z), linewidth=1.8)
+                ax.set_title(label, fontsize=10, wrap=True)
+                ax.set_xlabel("Re(Z) / ohm")
+                ax.set_ylabel("-Im(Z) / ohm")
+                ax.grid(True, linestyle=":", alpha=0.35)
+                ax.set_aspect("equal", adjustable="datalim")
+                fig.tight_layout()
+                fig.savefig(png_dir / f"eis_{eis_idx}.png", dpi=180, bbox_inches="tight")
+                plt.close(fig)
+
+        return output_dir
+
     def generate_data(
         self,
-        target_per_relabel: int = 5,
+        target_per_relabel: int | Mapping[str, int] = 5,
         target_relabel_ecms: Optional[Sequence[str]] = None,
         min_batches: int = 1,
         max_batches: int = 200,
@@ -2084,7 +2308,7 @@ class DataGen:
 
         Parameters
         ----------
-        target_per_relabel : int, default=5
+        target_per_relabel : int or mapping, default=5
             Desired number of rows per final relabelled ECM.
         target_relabel_ecms : sequence of str, optional
             Explicit final target labels. If omitted, first-batch labels define
@@ -2102,9 +2326,9 @@ class DataGen:
         export : bool, default=True
             Whether to write the final CSV export.
         export_plots : bool, default=False
-            Whether to write a ZIP archive of final Nyquist plots.
+            Whether to write one Nyquist plot PNG per final row.
         export_dataprep : bool, default=False
-            Whether to write AutoREC DataPrep-style curve folders.
+            Whether to write per-ECM CSV and PNG data folders.
         excluded_simplified_ecms : sequence of str or None, optional
             Final simplified/relabelled ECM labels to exclude. ``None`` uses
             ``self.excluded_simplified_ecms``. Pass an empty sequence to disable
@@ -2142,11 +2366,11 @@ class DataGen:
             self._log(f"Saved table CSV: {csv_path}")
 
             if export_plots:
-                zip_path = self.export_eis_plot_zip(final_df)
-                self._log(f"Saved EIS plot zip: {zip_path}")
+                plot_dir = self.export_eis_plot_folder(final_df)
+                self._log(f"Saved EIS plot folder: {plot_dir}")
 
             if export_dataprep:
-                dataprep_dir = self.export_dataprep_folder(final_df)
-                self._log(f"Saved DataPrep folder: {dataprep_dir}")
+                data_dir = self.export_eis_data_folder(final_df)
+                self._log(f"Saved EIS data folder: {data_dir}")
 
         return balanced_df, batch_infos
