@@ -1718,6 +1718,9 @@ class DataGen:
         n_random_candidates: Optional[int] = None,
         max_selected_curves: Optional[int] = None,
         excluded_simplified_ecms: Optional[Sequence[str]] = None,
+        export_selected_samples: bool = False,
+        export_output_dir: Optional[str | Path] = None,
+        use_relabel_simulation: bool = True,
     ) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
         """Run batches until each target relabelled ECM has enough rows.
 
@@ -1742,6 +1745,15 @@ class DataGen:
         excluded_simplified_ecms : sequence of str or None, optional
             Final simplified/relabelled ECM labels to exclude. ``None`` uses
             ``self.excluded_simplified_ecms``.
+        export_selected_samples : bool, default=False
+            Whether to export each needed sample immediately after it is kept.
+        export_output_dir : str or pathlib.Path, optional
+            Root directory for immediate per-ECM exports. Defaults to
+            ``self.output_dir``.
+        use_relabel_simulation : bool, default=True
+            Whether immediate exports simulate impedance from the final
+            relabelled ECM and parameters. If ``False``, the stored source
+            impedance is exported.
 
         Returns
         -------
@@ -1801,6 +1813,11 @@ class DataGen:
         kept_reference_curves = []
         batch_infos = []
         counts = pd.Series(dtype=int)
+        export_counts: Dict[str, int] = {}
+        export_root = None
+
+        if export_selected_samples:
+            export_root = self.prepare_eis_data_folder(export_output_dir)
 
         for batch_id in range(max_batches):
             seed = seed_start + batch_id
@@ -1836,6 +1853,22 @@ class DataGen:
             if not kept_df.empty:
                 kept_batches.append(kept_df)
                 kept_reference_curves.extend(kept_df["curve"].tolist())
+
+            exported_sample_count = 0
+            if export_selected_samples and export_root is not None:
+                for _, row in kept_df.iterrows():
+                    label = self.ecm_output_folder_name(row["relabel_ecm"])
+                    sample_index = export_counts.get(label, 0) + 1
+                    self.export_eis_sample(
+                        row,
+                        sample_index=sample_index,
+                        output_dir=export_root,
+                        use_relabel_simulation=use_relabel_simulation,
+                    )
+                    export_counts[label] = sample_index
+                    exported_sample_count += 1
+
+            batch_info["exported_sample_count"] = exported_sample_count
 
             added_counts = counts.subtract(before_counts, fill_value=0).astype(int)
             under_target = counts[counts < target_counts]
@@ -2217,6 +2250,129 @@ class DataGen:
 
         return output_dir
 
+    @staticmethod
+    def ecm_output_folder_name(ecm: Any) -> str:
+        """Return the dynamic output-folder name for an ECM label.
+
+        Parameters
+        ----------
+        ecm : object
+            Final relabelled ECM value. Missing values use ``unknown_ecm``.
+
+        Returns
+        -------
+        str
+            ECM label with only filesystem path separators replaced. Circuit
+            brackets, component labels, and indices are preserved.
+        """
+        if pd.isna(ecm):
+            return "unknown_ecm"
+
+        return re.sub(r"[\\/]+", "_", str(ecm)).strip() or "unknown_ecm"
+
+    def prepare_eis_data_folder(
+        self,
+        output_dir: Optional[str | Path] = None,
+    ) -> Path:
+        """Prepare an empty root directory for immediate EIS exports.
+
+        Parameters
+        ----------
+        output_dir : str or pathlib.Path, optional
+            Root output directory. Defaults to ``self.output_dir``.
+
+        Returns
+        -------
+        pathlib.Path
+            Prepared output directory.
+
+        Notes
+        -----
+        Existing subdirectories are removed at the start of a generation run
+        so rerunning generation cannot leave stale ECM groups or sample files.
+        Files directly inside the root directory are preserved.
+        """
+        output_dir = self.output_dir if output_dir is None else Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        for child in output_dir.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child)
+
+        return output_dir
+
+    def export_eis_sample(
+        self,
+        row: pd.Series,
+        sample_index: int,
+        output_dir: Optional[str | Path] = None,
+        use_relabel_simulation: bool = True,
+    ) -> Tuple[Path, Path]:
+        """Immediately export one selected EIS sample as CSV and PNG.
+
+        Parameters
+        ----------
+        row : pandas.Series
+            Selected row containing ``relabel_ecm``, ``relabel_params``, and
+            stored impedance data.
+        sample_index : int
+            One-based sample number within this row's ECM group.
+        output_dir : str or pathlib.Path, optional
+            Root output directory. Defaults to ``self.output_dir``.
+        use_relabel_simulation : bool, default=True
+            If ``True``, simulate impedance from the final relabelled ECM and
+            parameters. Otherwise export the stored ``Z`` values.
+
+        Returns
+        -------
+        tuple of pathlib.Path
+            Written CSV path and PNG path.
+        """
+        import matplotlib.pyplot as plt
+
+        if sample_index < 1:
+            raise ValueError("sample_index must be at least 1")
+
+        output_dir = self.output_dir if output_dir is None else Path(output_dir)
+        label = "unknown_ecm" if pd.isna(row["relabel_ecm"]) else str(row["relabel_ecm"])
+        label_dir = output_dir / self.ecm_output_folder_name(label)
+        csv_dir = label_dir / "csv"
+        png_dir = label_dir / "png"
+        csv_dir.mkdir(parents=True, exist_ok=True)
+        png_dir.mkdir(parents=True, exist_ok=True)
+
+        if use_relabel_simulation:
+            Z = np.asarray(self.simulate_relabel_impedance(row, self.random_ecm_freq))
+        else:
+            Z = np.asarray(row["Z"])
+
+        freq = self.random_ecm_freq.astype(float)
+        freq_order = np.argsort(freq)
+        curve_df = pd.DataFrame(
+            {
+                "freq": freq[freq_order],
+                "Z_real": np.real(Z)[freq_order].astype(float),
+                "Z_imag": np.imag(Z)[freq_order].astype(float),
+            }
+        )
+
+        csv_path = csv_dir / f"eis_{sample_index}.csv"
+        png_path = png_dir / f"eis_{sample_index}.png"
+        curve_df.to_csv(csv_path, index=False)
+
+        fig, ax = plt.subplots(figsize=(5.8, 5.2))
+        ax.plot(np.real(Z), -np.imag(Z), linewidth=1.8)
+        ax.set_title(label, fontsize=10, wrap=True)
+        ax.set_xlabel("Re(Z) / ohm")
+        ax.set_ylabel("-Im(Z) / ohm")
+        ax.grid(True, linestyle=":", alpha=0.35)
+        ax.set_aspect("equal", adjustable="datalim")
+        fig.tight_layout()
+        fig.savefig(png_path, dpi=180, bbox_inches="tight")
+        plt.close(fig)
+
+        return csv_path, png_path
+
     def export_eis_data_folder(
         self,
         final_relabel_df: pd.DataFrame,
@@ -2241,52 +2397,20 @@ class DataGen:
             Root directory with ``<relabel_ecm>/csv/eis_N.csv`` and
             ``<relabel_ecm>/png/eis_N.png`` for each generated curve.
         """
-        import matplotlib.pyplot as plt
-
-        output_dir = self.output_dir if output_dir is None else Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
+        output_dir = self.prepare_eis_data_folder(output_dir)
         sorted_df = final_relabel_df.sort_values(["relabel_ecm", "global_position"])
-        freq = self.random_ecm_freq.astype(float)
-        freq_order = np.argsort(freq)
+        sample_counts: Dict[str, int] = {}
 
-        for label, label_df in sorted_df.groupby("relabel_ecm", sort=True, dropna=False):
-            label = "unknown_ecm" if pd.isna(label) else str(label)
-            safe_label = re.sub(r"[\\/]+", "_", label).strip() or "unknown_ecm"
-            label_dir = output_dir / safe_label
-            if label_dir.exists():
-                shutil.rmtree(label_dir)
-
-            csv_dir = label_dir / "csv"
-            png_dir = label_dir / "png"
-            csv_dir.mkdir(parents=True, exist_ok=True)
-            png_dir.mkdir(parents=True, exist_ok=True)
-
-            for eis_idx, (_, row) in enumerate(label_df.iterrows(), start=1):
-                if use_relabel_simulation:
-                    Z = np.asarray(self.simulate_relabel_impedance(row, self.random_ecm_freq))
-                else:
-                    Z = np.asarray(row["Z"])
-
-                curve_df = pd.DataFrame(
-                    {
-                        "freq": freq[freq_order],
-                        "Z_real": np.real(Z)[freq_order].astype(float),
-                        "Z_imag": np.imag(Z)[freq_order].astype(float),
-                    }
-                )
-                curve_df.to_csv(csv_dir / f"eis_{eis_idx}.csv", index=False)
-
-                fig, ax = plt.subplots(figsize=(5.8, 5.2))
-                ax.plot(np.real(Z), -np.imag(Z), linewidth=1.8)
-                ax.set_title(label, fontsize=10, wrap=True)
-                ax.set_xlabel("Re(Z) / ohm")
-                ax.set_ylabel("-Im(Z) / ohm")
-                ax.grid(True, linestyle=":", alpha=0.35)
-                ax.set_aspect("equal", adjustable="datalim")
-                fig.tight_layout()
-                fig.savefig(png_dir / f"eis_{eis_idx}.png", dpi=180, bbox_inches="tight")
-                plt.close(fig)
+        for _, row in sorted_df.iterrows():
+            label = self.ecm_output_folder_name(row["relabel_ecm"])
+            sample_index = sample_counts.get(label, 0) + 1
+            self.export_eis_sample(
+                row,
+                sample_index=sample_index,
+                output_dir=output_dir,
+                use_relabel_simulation=use_relabel_simulation,
+            )
+            sample_counts[label] = sample_index
 
         return output_dir
 
@@ -2328,7 +2452,9 @@ class DataGen:
         export_plots : bool, default=False
             Whether to write one Nyquist plot PNG per final row.
         export_dataprep : bool, default=False
-            Whether to write per-ECM CSV and PNG data folders.
+            Whether to write each kept sample immediately into dynamic per-ECM
+            ``csv`` and ``png`` folders. Export occurs during batch generation,
+            rather than after all target counts have been reached.
         excluded_simplified_ecms : sequence of str or None, optional
             Final simplified/relabelled ECM labels to exclude. ``None`` uses
             ``self.excluded_simplified_ecms``. Pass an empty sequence to disable
@@ -2349,6 +2475,8 @@ class DataGen:
             seed_start=seed_start,
             n_random_candidates=n_random_candidates,
             max_selected_curves=max_selected_curves,
+            export_selected_samples=export_dataprep,
+            export_output_dir=self.output_dir,
         )
 
         counts = self.relabel_group_counts(balanced_df)
@@ -2368,9 +2496,5 @@ class DataGen:
             if export_plots:
                 plot_dir = self.export_eis_plot_folder(final_df)
                 self._log(f"Saved EIS plot folder: {plot_dir}")
-
-            if export_dataprep:
-                data_dir = self.export_eis_data_folder(final_df)
-                self._log(f"Saved EIS data folder: {data_dir}")
 
         return balanced_df, batch_infos
