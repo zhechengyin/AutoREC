@@ -21,7 +21,7 @@ generator = DataGen(
 )
 
 balanced_df, batch_infos = generator.generate_data(
-    target_per_relabel=5,
+    target_num=150,
     n_random_candidates=5000,
     max_selected_curves=100,
     max_batches=200,
@@ -32,6 +32,7 @@ balanced_df, batch_infos = generator.generate_data(
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import re
@@ -70,9 +71,14 @@ DEFAULT_PARAM_BOUNDS = {
     "L": (1e-9, 1e1),
 }
 
+PIPELINE_DIR = Path(__file__).resolve().parent
+
 
 class DataGen:
     """Generate, relabel, balance, and export EIS data for one source ECM.
+
+    The class also owns the CLI entry-point helpers used by the standalone
+    sample-generation script.
 
     The class wraps the notebook workflow for random ECM parameter sampling,
     impedance simulation, curve filtering, diverse curve selection, parser
@@ -128,6 +134,7 @@ class DataGen:
     verbose : bool, default=True
         Whether progress messages are printed.
     """
+
 
     def __init__(
         self,
@@ -201,6 +208,85 @@ class DataGen:
         self.random_ecm_fn = ae.utils.generate_circuit_fn(self.random_ecm_circuit)
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def parse_target(value: str) -> Tuple[str, int]:
+        """Parse one ``ECM=COUNT`` command-line target."""
+        try:
+            label, count_text = value.rsplit("=", maxsplit=1)
+            count = int(count_text)
+        except (TypeError, ValueError) as exc:
+            raise argparse.ArgumentTypeError(
+                f"Expected ECM=COUNT, received {value!r}"
+            ) from exc
+
+        label = label.strip()
+        if not label or count < 1:
+            raise argparse.ArgumentTypeError(
+                "The ECM label must be non-empty and COUNT must be at least 1"
+            )
+
+        return label, count
+
+    @staticmethod
+    def build_argument_parser() -> argparse.ArgumentParser:
+        """Build the command-line parser for data generation."""
+        parser = argparse.ArgumentParser(
+            description="Generate balanced AutoREC EIS samples into per-ECM folders."
+        )
+        parser.add_argument(
+            "--source-ecm",
+            default="R1-[P2,R3]-[P4,R5]",
+            help="Source ECM used for random parameter sampling.",
+        )
+        parser.add_argument(
+            "--output-dir",
+            type=Path,
+            default=PIPELINE_DIR / "data",
+            help="Output root. Defaults to generate_data_pipline/data.",
+        )
+        parser.add_argument(
+            "--target-num",
+            type=int,
+            default=150,
+            help="Number of samples required for every ECM discovered in the first batch.",
+        )
+        parser.add_argument("--max-batches", type=int, default=100)
+        parser.add_argument("--seed-start", type=int, default=2026)
+        parser.add_argument("--random-candidates", type=int, default=5000)
+        parser.add_argument("--selected-curves", type=int, default=150)
+        return parser
+
+    def run_from_args(self, args: argparse.Namespace) -> int:
+        """Execute the standalone generation workflow from parsed CLI args."""
+        output_dir = args.output_dir.expanduser().resolve()
+
+        self.random_ecm_circuit = args.source_ecm
+        self.output_dir = output_dir
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.random_ecm_param_names = ae.parser.get_parameter_labels(
+            self.random_ecm_circuit
+        )
+        self.random_ecm_fn = ae.utils.generate_circuit_fn(
+            self.random_ecm_circuit
+        )
+
+        self.generate_data(
+            target_num=args.target_num,
+            min_batches=1,
+            max_batches=args.max_batches,
+            seed_start=args.seed_start,
+            n_random_candidates=args.random_candidates,
+            max_selected_curves=args.selected_curves,
+            export=False,
+            export_dataprep=True,
+        )
+        return 0
+
+    def main(self, argv: Optional[Sequence[str]] = None) -> int:
+        """Run the CLI entry point for balanced sample generation."""
+        args = self.build_argument_parser().parse_args(argv)
+        return self.run_from_args(args)
 
     # ------------------------------------------------------------------
     # General utilities
@@ -534,7 +620,11 @@ class DataGen:
 
         valid_params, valid_Z, valid_curves = [], [], []
 
-        for params in tqdm(params_list, desc="Simulating random candidates"):
+        for params in tqdm(
+            params_list,
+            desc="Simulating random candidates",
+            disable=True,
+        ):
             try:
                 Z = circuit_fn(
                     frequencies, self.params_to_array(params, param_names=param_names)
@@ -896,6 +986,7 @@ class DataGen:
                 zip(params_list, Z_list, curves),
                 total=len(params_list),
                 desc="Parser full simplify selected curves",
+                disable=True,
             )
         ):
             record = {
@@ -1721,6 +1812,7 @@ class DataGen:
         export_selected_samples: bool = False,
         export_output_dir: Optional[str | Path] = None,
         use_relabel_simulation: bool = True,
+        live_plot: bool = True,
     ) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
         """Run batches until each target relabelled ECM has enough rows.
 
@@ -1819,6 +1911,8 @@ class DataGen:
         if export_selected_samples:
             export_root = self.prepare_eis_data_folder(export_output_dir)
 
+        live_plot_path = self.output_dir / "generation_analysis.png"
+
         for batch_id in range(max_batches):
             seed = seed_start + batch_id
 
@@ -1871,17 +1965,60 @@ class DataGen:
             batch_info["exported_sample_count"] = exported_sample_count
 
             added_counts = counts.subtract(before_counts, fill_value=0).astype(int)
-            under_target = counts[counts < target_counts]
-            target_note = "manual target" if use_manual_targets else "first-batch target"
+            batch_info["added_counts"] = {
+                str(label): int(value) for label, value in added_counts.items()
+            }
+            batch_info["accumulated_counts"] = {
+                str(label): int(value) for label, value in counts.items()
+            }
+            batch_info["discovered_group_count"] = len(discovered_labels)
 
-            self._log(
-                f"Batch {batch_id + 1}: {target_note} groups {len(counts)}, "
-                f"discovered groups {len(discovered_labels)}"
-            )
-            self._log("Added this batch:")
-            self._log(added_counts.to_string())
-            self._log("Accumulated target counts:")
-            self._log(counts.to_string())
+            if live_plot:
+                import matplotlib
+
+                matplotlib.use("Agg", force=True)
+                import matplotlib.pyplot as plt
+
+                batch_numbers = np.arange(1, len(batch_infos) + 1)
+                fig, ax = plt.subplots(
+                    figsize=(max(9.0, 0.55 * len(batch_infos)), 6.0)
+                )
+
+                for label in target_labels:
+                    values = [
+                        int(info.get("added_counts", {}).get(label, 0))
+                        for info in batch_infos
+                    ]
+                    ax.plot(
+                        batch_numbers,
+                        values,
+                        marker="o",
+                        linewidth=1.8,
+                        label=label,
+                    )
+
+                ax.set_title("Accepted samples generated per iteration")
+                ax.set_xlabel("Generation iteration")
+                ax.set_ylabel("New accepted samples")
+                ax.set_xticks(batch_numbers)
+                ax.grid(True, linestyle=":", alpha=0.35)
+
+                if target_labels:
+                    ax.legend(
+                        title="Relabelled ECM",
+                        bbox_to_anchor=(1.02, 1),
+                        loc="upper left",
+                    )
+
+                fig.tight_layout()
+                fig.savefig(
+                    live_plot_path,
+                    dpi=200,
+                    bbox_inches="tight",
+                )
+                plt.close(fig)
+
+            under_target = counts[counts < target_counts]
 
             if batch_id + 1 >= min_batches and under_target.empty and len(counts) > 0:
                 return pd.concat(kept_batches, ignore_index=True), batch_infos
@@ -1891,6 +2028,79 @@ class DataGen:
             f"{max_batches} batches. Target counts:\n{target_counts.to_string()}\n"
             f"Current counts:\n{counts.to_string()}"
         )
+
+    def plot_generation_analysis(
+        self,
+        batch_infos: Sequence[Mapping[str, Any]],
+        target_labels: Optional[Sequence[str]] = None,
+        output_path: Optional[str | Path] = None,
+        show: bool = True,
+    ) -> Path:
+        """Plot newly accepted samples per generation iteration as lines.
+
+        Each relabelled ECM is shown as one line. The plot is saved and,
+        by default, displayed as the function output.
+        """
+        import matplotlib.pyplot as plt
+
+        if not batch_infos:
+            raise ValueError("Cannot plot generation analysis without batch information.")
+
+        if output_path is None:
+            output_path = self.output_dir / "generation_analysis.png"
+        else:
+            output_path = Path(output_path)
+
+        if target_labels is None:
+            target_labels = []
+            for info in batch_infos:
+                for label in info.get("added_counts", {}):
+                    if label not in target_labels:
+                        target_labels.append(label)
+        else:
+            target_labels = list(target_labels)
+
+        batch_numbers = np.arange(1, len(batch_infos) + 1)
+
+        fig, ax = plt.subplots(
+            figsize=(max(9.0, 0.55 * len(batch_infos)), 6.0)
+        )
+
+        for label in target_labels:
+            values = [
+                int(info.get("added_counts", {}).get(label, 0))
+                for info in batch_infos
+            ]
+            ax.plot(
+                batch_numbers,
+                values,
+                marker="o",
+                linewidth=1.8,
+                label=label,
+            )
+
+        ax.set_title("Accepted samples generated per iteration")
+        ax.set_xlabel("Generation iteration")
+        ax.set_ylabel("New accepted samples")
+        ax.set_xticks(batch_numbers)
+        ax.grid(True, linestyle=":", alpha=0.35)
+
+        if target_labels:
+            ax.legend(
+                title="Relabelled ECM",
+                bbox_to_anchor=(1.02, 1),
+                loc="upper left",
+            )
+
+        fig.tight_layout()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=200, bbox_inches="tight")
+
+        if show:
+            plt.show()
+
+        plt.close(fig)
+        return output_path
 
     # ------------------------------------------------------------------
     # Export
@@ -2298,6 +2508,8 @@ class DataGen:
         for child in output_dir.iterdir():
             if child.is_dir():
                 shutil.rmtree(child)
+            else:
+                child.unlink()
 
         return output_dir
 
@@ -2416,8 +2628,7 @@ class DataGen:
 
     def generate_data(
         self,
-        target_per_relabel: int | Mapping[str, int] = 5,
-        target_relabel_ecms: Optional[Sequence[str]] = None,
+        target_num: int = 150,
         min_batches: int = 1,
         max_batches: int = 200,
         seed_start: int = 1000,
@@ -2426,49 +2637,16 @@ class DataGen:
         export: bool = True,
         export_plots: bool = False,
         export_dataprep: bool = False,
+        live_plot: bool = True,
         excluded_simplified_ecms: Optional[Sequence[str]] = None,
     ) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
-        """Run the complete balanced generation and relabelling workflow.
-
-        Parameters
-        ----------
-        target_per_relabel : int or mapping, default=5
-            Desired number of rows per final relabelled ECM.
-        target_relabel_ecms : sequence of str, optional
-            Explicit final target labels. If omitted, first-batch labels define
-            the target set.
-        min_batches : int, default=1
-            Minimum number of batches to process.
-        max_batches : int, default=200
-            Maximum number of batches to process.
-        seed_start : int, default=1000
-            First batch seed.
-        n_random_candidates : int, optional
-            Number of random candidates sampled per batch.
-        max_selected_curves : int, optional
-            Maximum selected curves relabelled per batch.
-        export : bool, default=True
-            Whether to write the final CSV export.
-        export_plots : bool, default=False
-            Whether to write one Nyquist plot PNG per final row.
-        export_dataprep : bool, default=False
-            Whether to write each kept sample immediately into dynamic per-ECM
-            ``csv`` and ``png`` folders. Export occurs during batch generation,
-            rather than after all target counts have been reached.
-        excluded_simplified_ecms : sequence of str or None, optional
-            Final simplified/relabelled ECM labels to exclude. ``None`` uses
-            ``self.excluded_simplified_ecms``. Pass an empty sequence to disable
-            the default exclusions.
-
-        Returns
-        -------
-        tuple
-            Balanced relabel result DataFrame and batch metadata list.
-        """
+        """Generate the same target number of samples for each discovered ECM."""
+        if not isinstance(target_num, int) or target_num < 1:
+            raise ValueError("target_num must be a positive integer.")
 
         balanced_df, batch_infos = self.run_balanced_relabel_dataset(
-            target_per_relabel=target_per_relabel,
-            target_relabel_ecms=target_relabel_ecms,
+            target_per_relabel=target_num,
+            target_relabel_ecms=None,
             excluded_simplified_ecms=excluded_simplified_ecms,
             min_batches=min_batches,
             max_batches=max_batches,
@@ -2477,24 +2655,22 @@ class DataGen:
             max_selected_curves=max_selected_curves,
             export_selected_samples=export_dataprep,
             export_output_dir=self.output_dir,
+            live_plot=live_plot,
         )
 
-        counts = self.relabel_group_counts(balanced_df)
-        self._log("Generated relabel counts before final export trimming:")
-        self._log(counts.to_string())
-        self._log(f"Generated rows: {len(balanced_df)}")
+        target_labels = list(batch_infos[0].get("added_counts", {}).keys())
+        if not target_labels:
+            target_labels = list(self.relabel_group_counts(balanced_df).index)
 
         if export:
-            final_df, export_df, csv_path = self.export_table_csv(
+            final_df, _, _ = self.export_table_csv(
                 balanced_df,
-                target_per_relabel=target_per_relabel,
-                target_relabel_ecms=target_relabel_ecms,
+                target_per_relabel=target_num,
+                target_relabel_ecms=target_labels,
                 excluded_simplified_ecms=excluded_simplified_ecms,
             )
-            self._log(f"Saved table CSV: {csv_path}")
 
             if export_plots:
-                plot_dir = self.export_eis_plot_folder(final_df)
-                self._log(f"Saved EIS plot folder: {plot_dir}")
+                self.export_eis_plot_folder(final_df)
 
         return balanced_df, batch_infos
