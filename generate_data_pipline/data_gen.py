@@ -1973,6 +1973,26 @@ class DataGen:
             }
             batch_info["discovered_group_count"] = len(discovered_labels)
 
+            print(f"\nBatch {batch_id + 1}/{max_batches}")
+            print(f"Accepted this batch : {len(kept_df)}")
+            print(f"Discovered ECMs     : {len(target_labels)}")
+            print("Current progress:")
+
+            for label in target_labels:
+                current = int(counts.get(label, 0))
+                target = int(target_counts[label])
+                print(f"  {label:<40} {current:>4}/{target}")
+
+            print("Remaining:")
+
+            for label in target_labels:
+                current = int(counts.get(label, 0))
+                target = int(target_counts[label])
+                remaining = max(0, target - current)
+                print(f"  {label:<40} {remaining:>4}")
+
+            print("-" * 64)
+
             if live_plot:
                 import matplotlib
 
