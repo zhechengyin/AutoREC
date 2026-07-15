@@ -10,9 +10,12 @@ from pathlib import Path
 
 PIPELINE_DIR = Path(__file__).resolve().parent
 REPOSITORY_DIR = PIPELINE_DIR.parent
+SOURCE_DIR = REPOSITORY_DIR / "src"
 
 if str(REPOSITORY_DIR) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_DIR))
+if str(SOURCE_DIR) not in sys.path:
+    sys.path.insert(0, str(SOURCE_DIR))
 
 from generate_data_pipline import DataGen
 

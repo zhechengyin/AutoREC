@@ -71,6 +71,8 @@ DEFAULT_PARAM_BOUNDS = {
     "L": (1e-9, 1e1),
 }
 
+DEFAULT_GENERATION_FIGSIZE = (7.5, 5.0)
+
 PIPELINE_DIR = Path(__file__).resolve().parent
 
 
@@ -1439,7 +1441,11 @@ class DataGen:
 
     @staticmethod
     def reindex_components(circuit: Optional[str]) -> Tuple[Optional[str], Dict[str, str]]:
-        """Renumber circuit components into canonical label order.
+        """Renumber all circuit components in one canonical global sequence.
+
+        Component types share a single left-to-right counter. For example,
+        ``R1-[P3,R5]`` becomes ``R1-[P2,R3]`` rather than using separate
+        counters for ``R`` and ``P`` components.
 
         Parameters
         ----------
@@ -1457,30 +1463,11 @@ class DataGen:
 
         circuit = str(circuit)
 
-        mapping = {}
-        used_names = {"R1"} if re.search(r"\bR1\b", circuit) else set()
-        counters = {"R": 2}
-
-        for match in re.finditer(r"([A-Z])(\d+)", circuit):
-            old_name = match.group(0)
-            prefix = match.group(1)
-
-            if old_name == "R1":
-                mapping[old_name] = "R1"
-                continue
-
-            if old_name in mapping:
-                continue
-
-            counters.setdefault(prefix, 1)
-
-            while f"{prefix}{counters[prefix]}" in used_names:
-                counters[prefix] += 1
-
-            new_name = f"{prefix}{counters[prefix]}"
-            mapping[old_name] = new_name
-            used_names.add(new_name)
-            counters[prefix] += 1
+        component_labels = list(dict.fromkeys(ae.parser.get_component_labels(circuit)))
+        mapping = {
+            old_name: f"{old_name[0]}{new_index}"
+            for new_index, old_name in enumerate(component_labels, start=1)
+        }
 
         new_circuit = re.sub(
             r"([A-Z])(\d+)",
@@ -1810,15 +1797,12 @@ class DataGen:
         )
 
     def relabel_complexity(self, circuit: str) -> int:
-        """Count non-ohmic top-level series elements in a relabelled ECM."""
-        parts = [
-            part.strip()
-            for part in self.split_top_level(str(circuit), sep="-")
-            if part.strip()
-        ]
-        if parts and re.fullmatch(r"R\d+", parts[0]):
-            parts = parts[1:]
-        return len(parts)
+        """Count fitted parameters in a relabelled ECM.
+
+        AutoEIS expands each CPE into its ``Pw`` and ``Pn`` parameters while
+        resistors, capacitors, and inductors each contribute one parameter.
+        """
+        return ae.parser.count_parameters(str(circuit))
 
     def run_balanced_relabel_dataset(
         self,
@@ -1840,7 +1824,8 @@ class DataGen:
         After every batch, the collected sample counts are inspected. The next
         source ECM is selected directly from the unfinished relabelled ECM
         groups, choosing the most complex unfinished group. No preset source
-        sequence is used.
+        sequence is used. Accepted curves remain diversity references after a
+        source-ECM switch so selection stays diverse across the full dataset.
         """
         if not isinstance(target_per_relabel, int) or target_per_relabel < 1:
             raise ValueError("target_per_relabel must be a positive integer.")
@@ -1986,9 +1971,7 @@ class DataGen:
                 import matplotlib.pyplot as plt
 
                 batch_numbers = np.arange(1, len(batch_infos) + 1)
-                fig, ax = plt.subplots(
-                    figsize=(max(9.0, 0.55 * len(batch_infos)), 6.0)
-                )
+                fig, ax = plt.subplots(figsize=DEFAULT_GENERATION_FIGSIZE)
 
                 for label in target_labels:
                     values = [
@@ -2041,7 +2024,9 @@ class DataGen:
                     previous_source_ecm = active_source_ecm
                     self.set_source_ecm(next_source_ecm)
                     active_source_ecm = next_source_ecm
-                    kept_reference_curves = []
+
+                    # Retain curves accepted under earlier source ECMs so the
+                    # next batch is selected against the full dataset history.
 
                     print(
                         "Generation target changed: "
@@ -2113,9 +2098,7 @@ class DataGen:
 
         batch_numbers = np.arange(1, len(batch_infos) + 1)
 
-        fig, ax = plt.subplots(
-            figsize=(max(9.0, 0.55 * len(batch_infos)), 6.0)
-        )
+        fig, ax = plt.subplots(figsize=DEFAULT_GENERATION_FIGSIZE)
 
         for label in target_labels:
             values = [
@@ -2468,13 +2451,13 @@ class DataGen:
         -------
         pathlib.Path
             Root directory containing one subdirectory per final ECM label. Each
-            subdirectory contains files named ``eis_1.csv``, ``eis_2.csv``,
-            and so on.
+            subdirectory contains files named ``sample_0001.csv``,
+            ``sample_0002.csv``, and so on.
 
         Notes
         -----
         The output is directly compatible with ``EISDataPrep(mode="process")``:
-        ``<output_dir>/<relabel_ecm>/eis_N.csv`` with columns ``freq``,
+        ``<output_dir>/<relabel_ecm>/sample_N.csv`` with columns ``freq``,
         ``Z_real``, and ``Z_imag``. Frequencies are written in ascending order.
         """
 
@@ -2490,7 +2473,7 @@ class DataGen:
             safe_label = re.sub(r"[\\/]+", "_", label).strip() or "unknown_ecm"
             label_dir = output_dir / safe_label
             label_dir.mkdir(parents=True, exist_ok=True)
-            for old_csv in label_dir.glob("eis_*.csv"):
+            for old_csv in label_dir.glob("*.csv"):
                 old_csv.unlink()
 
             for eis_idx, (_, row) in enumerate(label_df.iterrows(), start=1):
@@ -2507,7 +2490,10 @@ class DataGen:
                     }
                 )
 
-                curve_df.to_csv(label_dir / f"eis_{eis_idx}.csv", index=False)
+                curve_df.to_csv(
+                    label_dir / f"sample_{eis_idx:04d}.csv",
+                    index=False,
+                )
 
         return output_dir
 
@@ -2599,9 +2585,8 @@ class DataGen:
         output_dir = self.output_dir if output_dir is None else Path(output_dir)
         label = "unknown_ecm" if pd.isna(row["relabel_ecm"]) else str(row["relabel_ecm"])
         label_dir = output_dir / self.ecm_output_folder_name(label)
-        csv_dir = label_dir / "csv"
         png_dir = label_dir / "png"
-        csv_dir.mkdir(parents=True, exist_ok=True)
+        label_dir.mkdir(parents=True, exist_ok=True)
         png_dir.mkdir(parents=True, exist_ok=True)
 
         if use_relabel_simulation:
@@ -2619,8 +2604,9 @@ class DataGen:
             }
         )
 
-        csv_path = csv_dir / f"eis_{sample_index}.csv"
-        png_path = png_dir / f"eis_{sample_index}.png"
+        sample_stem = f"sample_{sample_index:04d}"
+        csv_path = label_dir / f"{sample_stem}.csv"
+        png_path = png_dir / f"{sample_stem}.png"
         curve_df.to_csv(csv_path, index=False)
 
         fig, ax = plt.subplots(figsize=(5.8, 5.2))
@@ -2657,8 +2643,8 @@ class DataGen:
         Returns
         -------
         pathlib.Path
-            Root directory with ``<relabel_ecm>/csv/eis_N.csv`` and
-            ``<relabel_ecm>/png/eis_N.png`` for each generated curve.
+            Root directory with ``<relabel_ecm>/sample_N.csv`` and
+            ``<relabel_ecm>/png/sample_N.png`` for each generated curve.
         """
         output_dir = self.prepare_eis_data_folder(output_dir)
         sorted_df = final_relabel_df.sort_values(["relabel_ecm", "global_position"])
