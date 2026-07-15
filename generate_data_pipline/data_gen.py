@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import pickle
 import re
 import shutil
 import warnings
@@ -1914,7 +1915,7 @@ class DataGen:
             if export_selected_samples and export_root is not None:
                 for _, row in kept_df.iterrows():
                     label = self.ecm_output_folder_name(row["relabel_ecm"])
-                    sample_index = export_counts.get(label, 0) + 1
+                    sample_index = export_counts.get(label, 0)
 
                     self.export_eis_sample(
                         row,
@@ -1923,7 +1924,7 @@ class DataGen:
                         use_relabel_simulation=use_relabel_simulation,
                     )
 
-                    export_counts[label] = sample_index
+                    export_counts[label] = sample_index + 1
                     exported_sample_count += 1
 
             added_counts = counts.subtract(
@@ -2451,8 +2452,8 @@ class DataGen:
         -------
         pathlib.Path
             Root directory containing one subdirectory per final ECM label. Each
-            subdirectory contains files named ``sample_0001.csv``,
-            ``sample_0002.csv``, and so on.
+            subdirectory contains files named ``sample_0000.csv``,
+            ``sample_0001.csv``, and so on, with matching pickle metadata files.
 
         Notes
         -----
@@ -2473,10 +2474,11 @@ class DataGen:
             safe_label = re.sub(r"[\\/]+", "_", label).strip() or "unknown_ecm"
             label_dir = output_dir / safe_label
             label_dir.mkdir(parents=True, exist_ok=True)
-            for old_csv in label_dir.glob("*.csv"):
-                old_csv.unlink()
+            for pattern in ("sample_*.csv", "sample_*.pkl"):
+                for old_export in label_dir.glob(pattern):
+                    old_export.unlink()
 
-            for eis_idx, (_, row) in enumerate(label_df.iterrows(), start=1):
+            for eis_idx, (_, row) in enumerate(label_df.iterrows()):
                 if use_relabel_simulation:
                     Z = np.asarray(self.simulate_relabel_impedance(row, self.random_ecm_freq))
                 else:
@@ -2490,9 +2492,15 @@ class DataGen:
                     }
                 )
 
-                curve_df.to_csv(
-                    label_dir / f"sample_{eis_idx:04d}.csv",
-                    index=False,
+                sample_stem = f"sample_{eis_idx:04d}"
+                curve_df.to_csv(label_dir / f"{sample_stem}.csv", index=False)
+                self.write_sample_metadata(
+                    row=row,
+                    sample_index=eis_idx,
+                    metadata_path=label_dir / f"{sample_stem}.pkl",
+                    exported_frequency=freq[freq_order],
+                    exported_impedance=Z[freq_order],
+                    use_relabel_simulation=use_relabel_simulation,
                 )
 
         return output_dir
@@ -2516,6 +2524,61 @@ class DataGen:
             return "unknown_ecm"
 
         return re.sub(r"[\\/]+", "_", str(ecm)).strip() or "unknown_ecm"
+
+    @staticmethod
+    def write_sample_metadata(
+        row: pd.Series,
+        sample_index: int,
+        metadata_path: Path,
+        exported_frequency: np.ndarray,
+        exported_impedance: np.ndarray,
+        use_relabel_simulation: bool,
+    ) -> Path:
+        """Write reproducibility and debugging metadata for one exported sample."""
+        metadata = {
+            "schema_version": 1,
+            "sample_index": int(sample_index),
+            "initial_circuit": row.get("original_ecm"),
+            "initial_parameters": row.get("params"),
+            "final_circuit": row.get("relabel_ecm"),
+            "final_parameters": row.get("relabel_params"),
+            "intermediate": {
+                "simplified_circuit": row.get("simplified_ecm"),
+                "simplified_parameters": row.get("simplified_params"),
+                "fim_relabel_circuit": row.get("fim_relabel_ecm"),
+                "fim_relabel_parameters": row.get("fim_relabel_params"),
+                "post_fim_simplified_circuit": row.get(
+                    "post_fim_simplified_ecm"
+                ),
+                "post_fim_simplified_parameters": row.get(
+                    "post_fim_simplified_params"
+                ),
+                "fim_candidates": row.get("fim_candidates"),
+            },
+            "provenance": {
+                "batch_id": row.get("batch_id"),
+                "batch_seed": row.get("batch_seed"),
+                "selected_position": row.get("selected_position"),
+                "global_position": row.get("global_position"),
+            },
+            "data": {
+                "stored_original_impedance": row.get("Z"),
+                "normalized_curve": row.get("curve"),
+                "exported_frequency_hz": np.asarray(exported_frequency).copy(),
+                "exported_impedance": np.asarray(exported_impedance).copy(),
+                "exported_from_final_simulation": bool(use_relabel_simulation),
+            },
+            "status": {
+                "relabel_failed": bool(row.get("relabel_failed", False)),
+                "failure_reason": row.get("failure_reason"),
+            },
+        }
+
+        metadata_path = Path(metadata_path)
+        with metadata_path.open("wb") as metadata_file:
+            pickle.dump(metadata, metadata_file, protocol=pickle.HIGHEST_PROTOCOL)
+
+        return metadata_path
 
     def prepare_eis_data_folder(
         self,
@@ -2565,7 +2628,7 @@ class DataGen:
             Selected row containing ``relabel_ecm``, ``relabel_params``, and
             stored impedance data.
         sample_index : int
-            One-based sample number within this row's ECM group.
+            Zero-based sample number within this row's ECM group.
         output_dir : str or pathlib.Path, optional
             Root output directory. Defaults to ``self.output_dir``.
         use_relabel_simulation : bool, default=True
@@ -2575,12 +2638,13 @@ class DataGen:
         Returns
         -------
         tuple of pathlib.Path
-            Written CSV path and PNG path.
+            Written CSV path and PNG path. A same-stem pickle metadata file is
+            written alongside the CSV.
         """
         import matplotlib.pyplot as plt
 
-        if sample_index < 1:
-            raise ValueError("sample_index must be at least 1")
+        if sample_index < 0:
+            raise ValueError("sample_index must be non-negative")
 
         output_dir = self.output_dir if output_dir is None else Path(output_dir)
         label = "unknown_ecm" if pd.isna(row["relabel_ecm"]) else str(row["relabel_ecm"])
@@ -2606,8 +2670,17 @@ class DataGen:
 
         sample_stem = f"sample_{sample_index:04d}"
         csv_path = label_dir / f"{sample_stem}.csv"
+        metadata_path = label_dir / f"{sample_stem}.pkl"
         png_path = png_dir / f"{sample_stem}.png"
         curve_df.to_csv(csv_path, index=False)
+        self.write_sample_metadata(
+            row=row,
+            sample_index=sample_index,
+            metadata_path=metadata_path,
+            exported_frequency=freq[freq_order],
+            exported_impedance=Z[freq_order],
+            use_relabel_simulation=use_relabel_simulation,
+        )
 
         fig, ax = plt.subplots(figsize=(5.8, 5.2))
         ax.plot(np.real(Z), -np.imag(Z), linewidth=1.8)
@@ -2643,8 +2716,9 @@ class DataGen:
         Returns
         -------
         pathlib.Path
-            Root directory with ``<relabel_ecm>/sample_N.csv`` and
-            ``<relabel_ecm>/png/sample_N.png`` for each generated curve.
+            Root directory with ``<relabel_ecm>/sample_N.csv``, matching
+            ``sample_N.pkl`` metadata, and ``<relabel_ecm>/png/sample_N.png``
+            for each generated curve.
         """
         output_dir = self.prepare_eis_data_folder(output_dir)
         sorted_df = final_relabel_df.sort_values(["relabel_ecm", "global_position"])
@@ -2652,14 +2726,14 @@ class DataGen:
 
         for _, row in sorted_df.iterrows():
             label = self.ecm_output_folder_name(row["relabel_ecm"])
-            sample_index = sample_counts.get(label, 0) + 1
+            sample_index = sample_counts.get(label, 0)
             self.export_eis_sample(
                 row,
                 sample_index=sample_index,
                 output_dir=output_dir,
                 use_relabel_simulation=use_relabel_simulation,
             )
-            sample_counts[label] = sample_index
+            sample_counts[label] = sample_index + 1
 
         return output_dir
 
