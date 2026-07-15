@@ -1799,9 +1799,30 @@ class DataGen:
 
         return pd.concat(kept, ignore_index=True), counts
 
+    def set_source_ecm(self, circuit: str) -> None:
+        """Switch the source ECM and rebuild cached AutoEIS helpers."""
+        self.random_ecm_circuit = str(circuit)
+        self.random_ecm_param_names = ae.parser.get_parameter_labels(
+            self.random_ecm_circuit
+        )
+        self.random_ecm_fn = ae.utils.generate_circuit_fn(
+            self.random_ecm_circuit
+        )
+
+    def relabel_complexity(self, circuit: str) -> int:
+        """Count non-ohmic top-level series elements in a relabelled ECM."""
+        parts = [
+            part.strip()
+            for part in self.split_top_level(str(circuit), sep="-")
+            if part.strip()
+        ]
+        if parts and re.fullmatch(r"R\d+", parts[0]):
+            parts = parts[1:]
+        return len(parts)
+
     def run_balanced_relabel_dataset(
         self,
-        target_per_relabel: int | Mapping[str, int] = 5,
+        target_per_relabel: int = 150,
         target_relabel_ecms: Optional[Sequence[str]] = None,
         min_batches: int = 1,
         max_batches: int = 200,
@@ -1814,97 +1835,29 @@ class DataGen:
         use_relabel_simulation: bool = True,
         live_plot: bool = True,
     ) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
-        """Run batches until each target relabelled ECM has enough rows.
+        """Discover groups and choose the next source from unfinished counts.
 
-        Parameters
-        ----------
-        target_per_relabel : int or mapping, default=5
-            Desired number of rows per final relabelled ECM. Pass a mapping
-            from final relabelled ECM to count for non-uniform targets.
-        target_relabel_ecms : sequence of str, optional
-            Explicit target labels. If omitted, labels discovered in the first
-            batch define the balancing target set.
-        min_batches : int, default=1
-            Minimum number of batches to process before allowing early stop.
-        max_batches : int, default=200
-            Maximum number of batches to process.
-        seed_start : int, default=1000
-            First batch seed. Batch ``i`` uses ``seed_start + i``.
-        n_random_candidates : int, optional
-            Number of sampled candidates per batch.
-        max_selected_curves : int, optional
-            Maximum selected curves per batch.
-        excluded_simplified_ecms : sequence of str or None, optional
-            Final simplified/relabelled ECM labels to exclude. ``None`` uses
-            ``self.excluded_simplified_ecms``.
-        export_selected_samples : bool, default=False
-            Whether to export each needed sample immediately after it is kept.
-        export_output_dir : str or pathlib.Path, optional
-            Root directory for immediate per-ECM exports. Defaults to
-            ``self.output_dir``.
-        use_relabel_simulation : bool, default=True
-            Whether immediate exports simulate impedance from the final
-            relabelled ECM and parameters. If ``False``, the stored source
-            impedance is exported.
-
-        Returns
-        -------
-        tuple
-            Balanced relabelled rows and list of batch metadata dictionaries.
-
-        Raises
-        ------
-        RuntimeError
-            If the requested balance target is not reached within
-            ``max_batches``.
+        After every batch, the collected sample counts are inspected. The next
+        source ECM is selected directly from the unfinished relabelled ECM
+        groups, choosing the most complex unfinished group. No preset source
+        sequence is used.
         """
-        use_explicit_target_counts = isinstance(target_per_relabel, Mapping)
-        use_manual_targets = (
-            target_relabel_ecms is not None or use_explicit_target_counts
-        )
-        if target_relabel_ecms is not None:
-            target_labels = list(dict.fromkeys(target_relabel_ecms))
-        elif use_explicit_target_counts:
-            target_labels = list(target_per_relabel)
-        else:
-            target_labels = None
-        excluded_keys = self.excluded_simplified_ecm_keys(excluded_simplified_ecms)
+        if not isinstance(target_per_relabel, int) or target_per_relabel < 1:
+            raise ValueError("target_per_relabel must be a positive integer.")
 
-        if target_labels is not None and excluded_keys:
-
-            def target_exclusion_keys(label: str) -> set[str]:
-                """Return raw and canonical exclusion-comparison keys for a target label."""
-                keys = set()
-                key = self.circuit_key(label)
-                if key is not None:
-                    keys.add(key)
-
-                try:
-                    normalized_label, _ = self.normalize_circuit_and_params(label)
-                    normalized_key = self.circuit_key(normalized_label)
-                except Exception:
-                    normalized_key = None
-
-                if normalized_key is not None:
-                    keys.add(normalized_key)
-
-                return keys
-
-            excluded_targets = [
-                label
-                for label in target_labels
-                if target_exclusion_keys(label) & excluded_keys
-            ]
-            if excluded_targets:
-                raise ValueError(
-                    "target_relabel_ecms contains ECMs that are excluded by "
-                    f"excluded_simplified_ecms: {excluded_targets}"
-                )
+        original_source_ecm = self.random_ecm_circuit
+        active_source_ecm = original_source_ecm
 
         kept_batches = []
         kept_reference_curves = []
         batch_infos = []
         counts = pd.Series(dtype=int)
+        target_labels = (
+            list(dict.fromkeys(target_relabel_ecms))
+            if target_relabel_ecms is not None
+            else []
+        )
+
         export_counts: Dict[str, int] = {}
         export_root = None
 
@@ -1912,6 +1865,8 @@ class DataGen:
             export_root = self.prepare_eis_data_folder(export_output_dir)
 
         live_plot_path = self.output_dir / "generation_analysis.png"
+        stable_batches = 0
+        discovery_patience = 3
 
         for batch_id in range(max_batches):
             seed = seed_start + batch_id
@@ -1924,17 +1879,38 @@ class DataGen:
                 excluded_simplified_ecms=excluded_simplified_ecms,
                 reference_curves=kept_reference_curves,
             )
+
+            batch_info["source_ecm"] = active_source_ecm
             batch_infos.append(batch_info)
 
-            discovered_labels = set(self.relabel_group_counts(batch_df).index)
+            discovered_now = sorted(
+                str(label)
+                for label in self.relabel_group_counts(batch_df).index
+            )
+            new_labels = [
+                label
+                for label in discovered_now
+                if label not in target_labels
+            ]
 
-            if target_labels is None:
-                target_labels = sorted(discovered_labels)
-                counts = pd.Series(0, index=target_labels, dtype=int)
-            elif counts.empty:
-                counts = pd.Series(0, index=target_labels, dtype=int)
+            if new_labels:
+                target_labels.extend(new_labels)
+                target_labels.sort(
+                    key=lambda label: (
+                        -self.relabel_complexity(label),
+                        label,
+                    )
+                )
+                stable_batches = 0
+            else:
+                stable_batches += 1
 
-            target_counts = self.target_count_series(target_per_relabel, target_labels)
+            counts = counts.reindex(target_labels, fill_value=0).astype(int)
+            target_counts = pd.Series(
+                target_per_relabel,
+                index=target_labels,
+                dtype=int,
+            )
             before_counts = counts.copy()
 
             kept_df, counts = self.take_needed_target_rows(
@@ -1949,51 +1925,61 @@ class DataGen:
                 kept_reference_curves.extend(kept_df["curve"].tolist())
 
             exported_sample_count = 0
+
             if export_selected_samples and export_root is not None:
                 for _, row in kept_df.iterrows():
                     label = self.ecm_output_folder_name(row["relabel_ecm"])
                     sample_index = export_counts.get(label, 0) + 1
+
                     self.export_eis_sample(
                         row,
                         sample_index=sample_index,
                         output_dir=export_root,
                         use_relabel_simulation=use_relabel_simulation,
                     )
+
                     export_counts[label] = sample_index
                     exported_sample_count += 1
 
-            batch_info["exported_sample_count"] = exported_sample_count
+            added_counts = counts.subtract(
+                before_counts,
+                fill_value=0,
+            ).astype(int)
 
-            added_counts = counts.subtract(before_counts, fill_value=0).astype(int)
+            batch_info["exported_sample_count"] = exported_sample_count
             batch_info["added_counts"] = {
-                str(label): int(value) for label, value in added_counts.items()
+                str(label): int(value)
+                for label, value in added_counts.items()
             }
             batch_info["accumulated_counts"] = {
-                str(label): int(value) for label, value in counts.items()
+                str(label): int(value)
+                for label, value in counts.items()
             }
-            batch_info["discovered_group_count"] = len(discovered_labels)
+            batch_info["discovered_group_count"] = len(target_labels)
+            batch_info["new_groups"] = list(new_labels)
 
             print(f"\nBatch {batch_id + 1}/{max_batches}")
+            print(f"Source ECM          : {active_source_ecm}")
             print(f"Accepted this batch : {len(kept_df)}")
-            print(f"Discovered ECMs     : {len(target_labels)}")
             print("Current progress:")
 
             for label in target_labels:
                 current = int(counts.get(label, 0))
-                target = int(target_counts[label])
-                print(f"  {label:<40} {current:>4}/{target}")
+                print(
+                    f"  {label:<45} "
+                    f"{current:>4}/{target_per_relabel}"
+                )
 
             print("Remaining:")
 
             for label in target_labels:
                 current = int(counts.get(label, 0))
-                target = int(target_counts[label])
-                remaining = max(0, target - current)
-                print(f"  {label:<40} {remaining:>4}")
+                remaining = max(0, target_per_relabel - current)
+                print(f"  {label:<45} {remaining:>4}")
 
-            print("-" * 64)
+            print("-" * 72)
 
-            if live_plot:
+            if live_plot and target_labels:
                 import matplotlib
 
                 matplotlib.use("Agg", force=True)
@@ -2022,13 +2008,11 @@ class DataGen:
                 ax.set_ylabel("New accepted samples")
                 ax.set_xticks(batch_numbers)
                 ax.grid(True, linestyle=":", alpha=0.35)
-
-                if target_labels:
-                    ax.legend(
-                        title="Relabelled ECM",
-                        bbox_to_anchor=(1.02, 1),
-                        loc="upper left",
-                    )
+                ax.legend(
+                    title="Relabelled ECM",
+                    bbox_to_anchor=(1.02, 1),
+                    loc="upper left",
+                )
 
                 fig.tight_layout()
                 fig.savefig(
@@ -2038,14 +2022,61 @@ class DataGen:
                 )
                 plt.close(fig)
 
-            under_target = counts[counts < target_counts]
+            unfinished_labels = [
+                label
+                for label in target_labels
+                if int(counts.get(label, 0)) < target_per_relabel
+            ]
 
-            if batch_id + 1 >= min_batches and under_target.empty and len(counts) > 0:
-                return pd.concat(kept_batches, ignore_index=True), batch_infos
+            if unfinished_labels:
+                next_source_ecm = max(
+                    unfinished_labels,
+                    key=lambda label: (
+                        self.relabel_complexity(label),
+                        label,
+                    ),
+                )
+
+                if next_source_ecm != active_source_ecm:
+                    previous_source_ecm = active_source_ecm
+                    self.set_source_ecm(next_source_ecm)
+                    active_source_ecm = next_source_ecm
+                    kept_reference_curves = []
+
+                    print(
+                        "Generation target changed: "
+                        f"{previous_source_ecm} -> {next_source_ecm}"
+                    )
+
+            all_targets_complete = bool(target_labels) and not unfinished_labels
+
+            if (
+                batch_id + 1 >= min_batches
+                and all_targets_complete
+                and stable_batches >= discovery_patience
+            ):
+                self.set_source_ecm(original_source_ecm)
+
+                if not kept_batches:
+                    return batch_df.iloc[0:0].copy(), batch_infos
+
+                return pd.concat(
+                    kept_batches,
+                    ignore_index=True,
+                ), batch_infos
+
+        self.set_source_ecm(original_source_ecm)
+
+        target_counts = pd.Series(
+            target_per_relabel,
+            index=target_labels,
+            dtype=int,
+        )
 
         raise RuntimeError(
-            "Balanced relabel dataset did not reach target counts within "
-            f"{max_batches} batches. Target counts:\n{target_counts.to_string()}\n"
+            "Balanced relabel dataset did not reach all dynamically discovered "
+            f"targets within {max_batches} batches.\n"
+            f"Target counts:\n{target_counts.to_string()}\n"
             f"Current counts:\n{counts.to_string()}"
         )
 
