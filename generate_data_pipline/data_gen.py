@@ -138,7 +138,6 @@ class DataGen:
         Whether progress messages are printed.
     """
 
-
     def __init__(
         self,
         random_ecm_circuit: str = "R1-[P2,R3]-[P4,R5]-[P6,R7]",
@@ -267,12 +266,8 @@ class DataGen:
         self.random_ecm_circuit = args.source_ecm
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.random_ecm_param_names = ae.parser.get_parameter_labels(
-            self.random_ecm_circuit
-        )
-        self.random_ecm_fn = ae.utils.generate_circuit_fn(
-            self.random_ecm_circuit
-        )
+        self.random_ecm_param_names = ae.parser.get_parameter_labels(self.random_ecm_circuit)
+        self.random_ecm_fn = ae.utils.generate_circuit_fn(self.random_ecm_circuit)
 
         self.generate_data(
             target_num=args.target_num,
@@ -1000,6 +995,7 @@ class DataGen:
                 "simplified_ecm": None,
                 "fim_relabel_ecm": None,
                 "post_fim_simplified_ecm": None,
+                "fim_identifiability_info": None,
                 "relabel_ecm": None,
                 "params": params,
                 "simplified_params": None,
@@ -1014,10 +1010,8 @@ class DataGen:
             }
 
             try:
-                simplified_ecm, simplified_params = self.run_parser_full_simplify(
-                    self.random_ecm_circuit,
-                    params,
-                    Z,
+                simplified_ecm, simplified_params, info = self.run_parser_full_simplify(
+                    self.random_ecm_circuit, params, Z
                 )
 
                 relabel_ecm, relabel_params = self.ensure_series_r1(
@@ -1039,6 +1033,7 @@ class DataGen:
                         "simplified_params": simplified_params,
                         "fim_relabel_params": simplified_params,
                         "post_fim_simplified_params": simplified_params,
+                        "fim_identifiability_info": info,
                         "relabel_params": relabel_params,
                         "fim_candidates": None,
                     }
@@ -1608,8 +1603,7 @@ class DataGen:
             missing = [label for label in labels if label not in target_per_relabel]
             if missing:
                 raise ValueError(
-                    "target_per_relabel is missing target count(s) for "
-                    f"label(s): {missing}"
+                    f"target_per_relabel is missing target count(s) for label(s): {missing}"
                 )
             return pd.Series(
                 {label: int(target_per_relabel[label]) for label in labels},
@@ -1658,17 +1652,12 @@ class DataGen:
             self.max_selected_curves if max_selected_curves is None else max_selected_curves
         )
 
-        candidates = self.sample_params(
-            n_candidates=n_random_candidates,
-            seed=seed,
-        )
+        candidates = self.sample_params(n_candidates=n_random_candidates, seed=seed)
 
         params, Z, curves = self.simulate_candidates(candidates)
 
         filtered_params, filtered_Z, filtered_curves, filter_info = self.filter_high_frequency(
-            params,
-            Z,
-            curves,
+            params, Z, curves
         )
 
         selected_params, selected_Z, selected_curves, selected_idx, selected_scores = (
@@ -1682,11 +1671,7 @@ class DataGen:
         )
 
         batch_df = self.run_relabel(
-            selected_params,
-            selected_Z,
-            selected_curves,
-            batch_seed=seed,
-            batch_id=batch_id,
+            selected_params, selected_Z, selected_curves, batch_seed=seed, batch_id=batch_id
         )
 
         batch_df = self.postprocess_relabels(batch_df)
@@ -1790,12 +1775,8 @@ class DataGen:
     def set_source_ecm(self, circuit: str) -> None:
         """Switch the source ECM and rebuild cached AutoEIS helpers."""
         self.random_ecm_circuit = str(circuit)
-        self.random_ecm_param_names = ae.parser.get_parameter_labels(
-            self.random_ecm_circuit
-        )
-        self.random_ecm_fn = ae.utils.generate_circuit_fn(
-            self.random_ecm_circuit
-        )
+        self.random_ecm_param_names = ae.parser.get_parameter_labels(self.random_ecm_circuit)
+        self.random_ecm_fn = ae.utils.generate_circuit_fn(self.random_ecm_circuit)
 
     def relabel_complexity(self, circuit: str) -> int:
         """Count fitted parameters in a relabelled ECM.
@@ -1839,9 +1820,7 @@ class DataGen:
         batch_infos = []
         counts = pd.Series(dtype=int)
         target_labels = (
-            list(dict.fromkeys(target_relabel_ecms))
-            if target_relabel_ecms is not None
-            else []
+            list(dict.fromkeys(target_relabel_ecms)) if target_relabel_ecms is not None else []
         )
 
         export_counts: Dict[str, int] = {}
@@ -1870,14 +1849,9 @@ class DataGen:
             batch_infos.append(batch_info)
 
             discovered_now = sorted(
-                str(label)
-                for label in self.relabel_group_counts(batch_df).index
+                str(label) for label in self.relabel_group_counts(batch_df).index
             )
-            new_labels = [
-                label
-                for label in discovered_now
-                if label not in target_labels
-            ]
+            new_labels = [label for label in discovered_now if label not in target_labels]
 
             if new_labels:
                 target_labels.extend(new_labels)
@@ -1927,19 +1901,14 @@ class DataGen:
                     export_counts[label] = sample_index + 1
                     exported_sample_count += 1
 
-            added_counts = counts.subtract(
-                before_counts,
-                fill_value=0,
-            ).astype(int)
+            added_counts = counts.subtract(before_counts, fill_value=0).astype(int)
 
             batch_info["exported_sample_count"] = exported_sample_count
             batch_info["added_counts"] = {
-                str(label): int(value)
-                for label, value in added_counts.items()
+                str(label): int(value) for label, value in added_counts.items()
             }
             batch_info["accumulated_counts"] = {
-                str(label): int(value)
-                for label, value in counts.items()
+                str(label): int(value) for label, value in counts.items()
             }
             batch_info["discovered_group_count"] = len(target_labels)
             batch_info["new_groups"] = list(new_labels)
@@ -1951,10 +1920,7 @@ class DataGen:
 
             for label in target_labels:
                 current = int(counts.get(label, 0))
-                print(
-                    f"  {label:<45} "
-                    f"{current:>4}/{target_per_relabel}"
-                )
+                print(f"  {label:<45} {current:>4}/{target_per_relabel}")
 
             print("Remaining:")
 
@@ -1976,8 +1942,7 @@ class DataGen:
 
                 for label in target_labels:
                     values = [
-                        int(info.get("added_counts", {}).get(label, 0))
-                        for info in batch_infos
+                        int(info.get("added_counts", {}).get(label, 0)) for info in batch_infos
                     ]
                     ax.plot(
                         batch_numbers,
@@ -2102,10 +2067,7 @@ class DataGen:
         fig, ax = plt.subplots(figsize=DEFAULT_GENERATION_FIGSIZE)
 
         for label in target_labels:
-            values = [
-                int(info.get("added_counts", {}).get(label, 0))
-                for info in batch_infos
-            ]
+            values = [int(info.get("added_counts", {}).get(label, 0)) for info in batch_infos]
             ax.plot(
                 batch_numbers,
                 values,
@@ -2197,7 +2159,11 @@ class DataGen:
             sorted_df.loc[sorted_df["relabel_ecm"] == label].head(int(target_counts[label]))
             for label in target_labels
         ]
-        final_df = pd.concat(final_parts, ignore_index=True) if final_parts else sorted_df.iloc[0:0].copy()
+        final_df = (
+            pd.concat(final_parts, ignore_index=True)
+            if final_parts
+            else sorted_df.iloc[0:0].copy()
+        )
 
         final_df.insert(0, "global_position", np.arange(len(final_df)))
 
@@ -2406,12 +2372,12 @@ class DataGen:
         for old_png in output_dir.glob("*.png"):
             old_png.unlink()
 
-        for _, row in final_relabel_df.sort_values(["relabel_ecm", "global_position"]).iterrows():
+        for _, row in final_relabel_df.sort_values(
+            ["relabel_ecm", "global_position"]
+        ).iterrows():
             Z = np.asarray(self.simulate_relabel_impedance(row, self.random_ecm_freq))
             label = str(row["relabel_ecm"])
-            safe_label = (
-                re.sub(r"[^A-Za-z0-9._-]+", "_", label).strip("_") or "unknown_ecm"
-            )
+            safe_label = re.sub(r"[^A-Za-z0-9._-]+", "_", label).strip("_") or "unknown_ecm"
 
             fig, ax = plt.subplots(figsize=(5.8, 5.2))
             ax.plot(np.real(Z), -np.imag(Z), linewidth=1.8)
@@ -2466,8 +2432,7 @@ class DataGen:
         output_dir.mkdir(parents=True, exist_ok=True)
 
         sorted_df = final_relabel_df.sort_values(["relabel_ecm", "global_position"])
-        freq = self.random_ecm_freq.astype(float)
-        freq_order = np.argsort(freq)
+        freq = self.random_ecm_freq.copy()
 
         for label, label_df in sorted_df.groupby("relabel_ecm", sort=True, dropna=False):
             label = "unknown_ecm" if pd.isna(label) else str(label)
@@ -2486,9 +2451,9 @@ class DataGen:
 
                 curve_df = pd.DataFrame(
                     {
-                        "freq": freq[freq_order],
-                        "Z_real": np.real(Z)[freq_order].astype(float),
-                        "Z_imag": np.imag(Z)[freq_order].astype(float),
+                        "freq": freq,
+                        "Z_real": np.real(Z),
+                        "Z_imag": np.imag(Z),
                     }
                 )
 
@@ -2498,8 +2463,8 @@ class DataGen:
                     row=row,
                     sample_index=eis_idx,
                     metadata_path=label_dir / f"{sample_stem}.pkl",
-                    exported_frequency=freq[freq_order],
-                    exported_impedance=Z[freq_order],
+                    exported_frequency=freq,
+                    exported_impedance=Z,
                     use_relabel_simulation=use_relabel_simulation,
                 )
 
@@ -2547,12 +2512,9 @@ class DataGen:
                 "simplified_parameters": row.get("simplified_params"),
                 "fim_relabel_circuit": row.get("fim_relabel_ecm"),
                 "fim_relabel_parameters": row.get("fim_relabel_params"),
-                "post_fim_simplified_circuit": row.get(
-                    "post_fim_simplified_ecm"
-                ),
-                "post_fim_simplified_parameters": row.get(
-                    "post_fim_simplified_params"
-                ),
+                "post_fim_simplified_circuit": row.get("post_fim_simplified_ecm"),
+                "post_fim_simplified_parameters": row.get("post_fim_simplified_params"),
+                "fim_identifiability_info": row.get("fim_identifiability_info"),
                 "fim_candidates": row.get("fim_candidates"),
             },
             "provenance": {
@@ -2658,13 +2620,12 @@ class DataGen:
         else:
             Z = np.asarray(row["Z"])
 
-        freq = self.random_ecm_freq.astype(float)
-        freq_order = np.argsort(freq)
+        freq = self.random_ecm_freq.copy()
         curve_df = pd.DataFrame(
             {
-                "freq": freq[freq_order],
-                "Z_real": np.real(Z)[freq_order].astype(float),
-                "Z_imag": np.imag(Z)[freq_order].astype(float),
+                "freq": freq,
+                "Z_real": np.real(Z),
+                "Z_imag": np.imag(Z),
             }
         )
 
@@ -2677,8 +2638,8 @@ class DataGen:
             row=row,
             sample_index=sample_index,
             metadata_path=metadata_path,
-            exported_frequency=freq[freq_order],
-            exported_impedance=Z[freq_order],
+            exported_frequency=freq,
+            exported_impedance=Z,
             use_relabel_simulation=use_relabel_simulation,
         )
 
