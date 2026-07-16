@@ -317,7 +317,7 @@ def simplify_unidentifiable_components(
         simplified_circuit string.
     """
 
-    suggestions, eigvals, _ = suggest_unidentifiable_params(
+    suggestions, eigvals, eigvecs = suggest_unidentifiable_params(
         circuit,
         freq,
         Z,
@@ -337,9 +337,9 @@ def simplify_unidentifiable_components(
             chi2 = np.mean(
                 EISObjective(circuit, freq, Z, method="normalized-chi-squared")(params_array)
             )
-            _, eigvals, _ = compute_fim(circuit, freq, Z, params_array)
+            _, eigvals, eigvecs = compute_fim(circuit, freq, Z, params_array)
             if full_output:
-                return [(circuit, params, chi2, eigvals)]
+                return [(circuit, params, chi2, eigvals, eigvecs)]
             else:
                 return [(circuit, params)]
         else:
@@ -382,7 +382,7 @@ def simplify_unidentifiable_components(
             if simplified_circuit not in [sc[0] for sc in simplified_circuits]:
                 if full_output:
                     simplified_circuits.append(
-                        (simplified_circuit, simplified_params, chi2, eigvals)
+                        (simplified_circuit, simplified_params, chi2, eigvals, eigvecs)
                     )
                 else:
                     simplified_circuits.append((simplified_circuit, simplified_params))
