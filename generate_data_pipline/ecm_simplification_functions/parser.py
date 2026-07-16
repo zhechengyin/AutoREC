@@ -465,7 +465,9 @@ def full_simplify(
     verbose=False,
 ):
     input_circuit = deepcopy(circuit)
+    info = {}
     for ii in range(max_iter):
+        info[ii] = {"input_circuit": input_circuit, "input_params": params}
         if verbose:
             print(f"Iteration {ii + 1}:")
             print(f"Current circuit: {input_circuit}")
@@ -474,6 +476,7 @@ def full_simplify(
         simplified_circuit, simplified_params = simplify(
             input_circuit, params, Pn_low, Pn_high
         )
+        info[ii]["series_parallel_combined"] = (simplified_circuit, simplified_params)
         if verbose:
             print(
                 "Simplified circuit after combining series and parallel components:",
@@ -502,7 +505,7 @@ def full_simplify(
         params_counts = np.inf
         simplified_circuit = None
         simplified_params = None
-        for sc, sp, chi2, eigvals in all_simplified_circuits:
+        for sc, sp, chi2, eigvals, _ in all_simplified_circuits:
             # Note: Sometimes eigenvalues have clear small values, but chi2 is still large.
             # With the following condition, we also do the check if this happens, not only
             # when chi2 is small.
@@ -515,6 +518,7 @@ def full_simplify(
                         params_counts = pcount
                         simplified_circuit = sc
                         simplified_params = sp
+        info[ii]["fim_identifiability"] = all_simplified_circuits
         # For safeguard, if no simplified circuit is found, keep the current one
         if simplified_circuit is None:
             simplified_circuit = input_circuit
@@ -531,6 +535,7 @@ def full_simplify(
         simplified_circuit, simplified_params = _move_ohmic_resistors_to_the_beginning(
             simplified_circuit, simplified_params
         )
+        info[ii]["ohmic_resistor_moved"] = (simplified_circuit, simplified_params)
         if verbose:
             print(
                 "Simplified circuit after moving ohmic resistors to the beginning:",
@@ -541,6 +546,7 @@ def full_simplify(
         simplified_circuit, simplified_params, _ = _reindex_components(
             simplified_circuit, simplified_params
         )
+        info[ii]["reindexed"] = (simplified_circuit, simplified_params)
         if verbose:
             print(
                 "Simplified circuit after reindexing components:",
@@ -555,7 +561,7 @@ def full_simplify(
             input_circuit = simplified_circuit
             params = simplified_params
 
-    return simplified_circuit, simplified_params
+    return simplified_circuit, simplified_params, info
 
 
 if __name__ == "__main__":
