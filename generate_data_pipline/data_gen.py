@@ -121,10 +121,14 @@ class DataGen:
         Minimum outer iterations passed to AutoEIS refitting.
     fim_refit_max_nfev : int, default=200
         Maximum function evaluations passed to AutoEIS refitting.
-    fim_identifiability_thresh : float, default=1e-6
+    fim_identifiability_thresh : float, default=1e-5
         Eigenvalue threshold used by FIM redundancy analysis.
-    r1_value : float, default=0.01
-        Fixed value assigned to the source/canonical ohmic resistor ``R1``.
+    final_consistency_max_iters : int, default=10
+        Maximum number of final-circuit simplification checks performed after
+        canonicalization.
+    r1_value : float, default=1e-4
+        Value assigned to the generated source ``R1`` and to a newly inserted
+        canonical ``R1``. Existing fitted series-resistor values are preserved.
     drop_pp_series : bool, default=True
         Whether final relabelled ECMs with series P-P chains are removed.
     drop_invalid_ecms : bool, default=True
@@ -154,8 +158,9 @@ class DataGen:
         fim_refit_max_iters: int = 5,
         fim_refit_min_iters: int = 2,
         fim_refit_max_nfev: int = 200,
-        fim_identifiability_thresh: float = 1e-6,
-        r1_value: float = 0.01,
+        fim_identifiability_thresh: float = 1e-5,
+        final_consistency_max_iters: int = 10,
+        r1_value: float = 1e-4,
         drop_pp_series: bool = True,
         drop_invalid_ecms: bool = True,
         excluded_simplified_ecms: Optional[Sequence[str]] = ("R1", "R1-C2"),
@@ -186,6 +191,9 @@ class DataGen:
         self.fim_refit_min_iters = fim_refit_min_iters
         self.fim_refit_max_nfev = fim_refit_max_nfev
         self.fim_identifiability_thresh = fim_identifiability_thresh
+        if final_consistency_max_iters < 1:
+            raise ValueError("final_consistency_max_iters must be at least 1")
+        self.final_consistency_max_iters = final_consistency_max_iters
 
         self.r1_value = r1_value
         self.drop_pp_series = drop_pp_series
@@ -903,13 +911,36 @@ class DataGen:
     # ------------------------------------------------------------------
     # Relabelling and postprocessing
     # ------------------------------------------------------------------
+    @staticmethod
+    def validate_and_order_circuit_params(
+        circuit: str,
+        params: Dict[str, float],
+    ) -> Dict[str, float]:
+        """Validate parameter labels and order them to match the circuit."""
+        if not isinstance(params, dict):
+            raise TypeError("params must be a dictionary keyed by parameter label")
+
+        expected_labels = ae.parser.get_parameter_labels(str(circuit))
+        expected_set = set(expected_labels)
+        actual_set = set(params)
+
+        if actual_set != expected_set:
+            missing = sorted(expected_set - actual_set)
+            extra = sorted(actual_set - expected_set)
+            raise ValueError(
+                "Circuit and parameter labels do not match. "
+                f"Missing labels: {missing}; extra labels: {extra}."
+            )
+
+        return {label: params[label] for label in expected_labels}
+
     def run_parser_full_simplify(
         self,
         circuit: str,
         params: Dict[str, float],
         Z: np.ndarray,
         verbose: bool = False,
-    ) -> Tuple[str, Dict[str, float]]:
+    ) -> Tuple[str, Dict[str, float], Optional[Dict[str, Any]]]:
         """Run the parser-provided full simplification for one EIS curve.
 
         Parameters
@@ -924,7 +955,9 @@ class DataGen:
         Returns
         -------
         tuple
-            Fully simplified circuit and parameter dictionary.
+            Fully simplified circuit, parameter dictionary, and optional FIM
+            simplification information. The information value is ``None`` for
+            older simplifier implementations that return only two values.
         """
         if self.full_simplify_fn is None:
             raise RuntimeError(
@@ -932,7 +965,9 @@ class DataGen:
                 f"Fallback import error: {self.full_simplify_import_error!r}"
             )
 
-        return self.full_simplify_fn(
+        params = self.validate_and_order_circuit_params(circuit, params)
+
+        result = self.full_simplify_fn(
             circuit,
             self.random_ecm_freq,
             Z,
@@ -945,6 +980,93 @@ class DataGen:
                 "max_nfev": self.fim_refit_max_nfev,
             },
             verbose=verbose,
+        )
+
+        if not isinstance(result, tuple) or len(result) not in (2, 3):
+            raise TypeError(
+                "full_simplify must return (circuit, params) or "
+                "(circuit, params, info)"
+            )
+
+        simplified_circuit, simplified_params = result[:2]
+        info = result[2] if len(result) == 3 else None
+        return simplified_circuit, simplified_params, info
+
+    def canonicalize_relabel_result(
+        self,
+        circuit: str,
+        params: Dict[str, float],
+    ) -> Tuple[str, Dict[str, float]]:
+        """Convert a simplification result into the exported ECM convention."""
+        circuit, params = self.ensure_series_r1(circuit, params)
+        circuit, params = self.convert_capacitors_to_cpes(circuit, params)
+        circuit = self.reorder_parallel_blocks_and_series_p(circuit)
+        circuit, mapping = self.reindex_components(circuit)
+        params = self.reindex_parameter_dict(params, mapping)
+        params = self.validate_and_order_circuit_params(circuit, params)
+        return circuit, params
+
+    def enforce_final_relabel_consistency(
+        self,
+        circuit: str,
+        params: Dict[str, float],
+    ) -> Tuple[str, Dict[str, float], str, Dict[str, float], List[Dict[str, Any]]]:
+        """Simplify the final simulated ECM repeatedly until its topology is stable."""
+        current_circuit, current_params = self.canonicalize_relabel_result(
+            circuit,
+            params,
+        )
+        seen_circuits = {current_circuit}
+        trace = []
+
+        for iteration in range(self.final_consistency_max_iters):
+            final_Z = self.simulate_circuit_with_params(
+                current_circuit,
+                current_params,
+                self.random_ecm_freq,
+            )
+            checked_circuit, checked_params, checked_info = (
+                self.run_parser_full_simplify(
+                    current_circuit,
+                    current_params,
+                    final_Z,
+                )
+            )
+            next_circuit, next_params = self.canonicalize_relabel_result(
+                checked_circuit,
+                checked_params,
+            )
+            trace.append(
+                {
+                    "iteration": iteration,
+                    "input_circuit": current_circuit,
+                    "simplified_circuit": checked_circuit,
+                    "canonical_circuit": next_circuit,
+                    "fim_identifiability_info": checked_info,
+                }
+            )
+
+            if next_circuit == current_circuit:
+                return (
+                    next_circuit,
+                    next_params,
+                    checked_circuit,
+                    checked_params,
+                    trace,
+                )
+
+            if next_circuit in seen_circuits:
+                raise RuntimeError(
+                    "Final relabel consistency check entered a circuit cycle: "
+                    f"{next_circuit}"
+                )
+
+            seen_circuits.add(next_circuit)
+            current_circuit, current_params = next_circuit, next_params
+
+        raise RuntimeError(
+            "Final relabel consistency check did not stabilize within "
+            f"{self.final_consistency_max_iters} iterations."
         )
 
     def run_relabel(
@@ -1005,6 +1127,8 @@ class DataGen:
                 "fim_candidates": None,
                 "Z": Z,
                 "curve": curve,
+                "final_Z": None,
+                "final_curve": None,
                 "relabel_failed": False,
                 "failure_reason": None,
             }
@@ -1013,29 +1137,37 @@ class DataGen:
                 simplified_ecm, simplified_params, info = self.run_parser_full_simplify(
                     self.random_ecm_circuit, params, Z
                 )
-
-                relabel_ecm, relabel_params = self.ensure_series_r1(
-                    simplified_ecm, simplified_params
+                (
+                    relabel_ecm,
+                    relabel_params,
+                    post_fim_simplified_ecm,
+                    post_fim_simplified_params,
+                    consistency_trace,
+                ) = self.enforce_final_relabel_consistency(
+                    simplified_ecm,
+                    simplified_params,
                 )
-                relabel_ecm, relabel_params = self.convert_capacitors_to_cpes(
-                    relabel_ecm, relabel_params
+                final_Z = self.simulate_circuit_with_params(
+                    relabel_ecm,
+                    relabel_params,
+                    self.random_ecm_freq,
                 )
-                relabel_ecm = self.reorder_parallel_blocks_and_series_p(relabel_ecm)
-                relabel_ecm, mapping = self.reindex_components(relabel_ecm)
-                relabel_params = self.reindex_parameter_dict(relabel_params, mapping)
+                final_curve = self.normalize_curve(final_Z)
 
                 record.update(
                     {
                         "simplified_ecm": simplified_ecm,
                         "fim_relabel_ecm": simplified_ecm,
-                        "post_fim_simplified_ecm": simplified_ecm,
+                        "post_fim_simplified_ecm": post_fim_simplified_ecm,
                         "relabel_ecm": relabel_ecm,
                         "simplified_params": simplified_params,
                         "fim_relabel_params": simplified_params,
-                        "post_fim_simplified_params": simplified_params,
+                        "post_fim_simplified_params": post_fim_simplified_params,
                         "fim_identifiability_info": info,
                         "relabel_params": relabel_params,
-                        "fim_candidates": None,
+                        "fim_candidates": consistency_trace,
+                        "final_Z": final_Z,
+                        "final_curve": final_curve,
                     }
                 )
 
@@ -1355,7 +1487,7 @@ class DataGen:
         circuit: Optional[str],
         params: Optional[Dict[str, float]] = None,
     ) -> Tuple[Optional[str], Optional[Dict[str, float]]]:
-        """Ensure the canonical circuit starts with a fixed series ``R1``.
+        """Ensure the canonical circuit starts with a series ``R1``.
 
         Parameters
         ----------
@@ -1368,7 +1500,8 @@ class DataGen:
         -------
         tuple
             Circuit with front series resistor renamed or inserted as ``R1``
-            and parameters updated with ``self.r1_value``.
+            and parameters updated. Existing fitted resistor values are
+            preserved; ``self.r1_value`` is used only for a newly inserted R1.
         """
         if circuit is None:
             return circuit, params
@@ -1386,8 +1519,9 @@ class DataGen:
 
             if isinstance(params, dict):
                 params = dict(params)
-                params.pop(old_front, None)
-                params["R1"] = self.r1_value
+                if old_front in params:
+                    fitted_value = params.pop(old_front)
+                    params["R1"] = fitted_value
 
             return circuit, params
 
@@ -1503,8 +1637,7 @@ class DataGen:
         params = self.reindex_parameter_dict(params, mapping)
 
         if isinstance(params, dict):
-            params = dict(params)
-            params["R1"] = self.r1_value
+            params = self.validate_and_order_circuit_params(circuit, params)
 
         return circuit, params
 
@@ -1882,7 +2015,10 @@ class DataGen:
 
             if not kept_df.empty:
                 kept_batches.append(kept_df)
-                kept_reference_curves.extend(kept_df["curve"].tolist())
+                reference_column = (
+                    "final_curve" if "final_curve" in kept_df.columns else "curve"
+                )
+                kept_reference_curves.extend(kept_df[reference_column].tolist())
 
             exported_sample_count = 0
 
@@ -2433,6 +2569,8 @@ class DataGen:
 
         sorted_df = final_relabel_df.sort_values(["relabel_ecm", "global_position"])
         freq = self.random_ecm_freq.copy()
+        freq_order = np.argsort(freq, kind="stable")
+        exported_frequency = freq[freq_order]
 
         for label, label_df in sorted_df.groupby("relabel_ecm", sort=True, dropna=False):
             label = "unknown_ecm" if pd.isna(label) else str(label)
@@ -2449,11 +2587,13 @@ class DataGen:
                 else:
                     Z = np.asarray(row["Z"])
 
+                exported_impedance = Z[freq_order]
+
                 curve_df = pd.DataFrame(
                     {
-                        "freq": freq,
-                        "Z_real": np.real(Z),
-                        "Z_imag": np.imag(Z),
+                        "freq": exported_frequency,
+                        "Z_real": np.real(exported_impedance),
+                        "Z_imag": np.imag(exported_impedance),
                     }
                 )
 
@@ -2463,8 +2603,9 @@ class DataGen:
                     row=row,
                     sample_index=eis_idx,
                     metadata_path=label_dir / f"{sample_stem}.pkl",
-                    exported_frequency=freq,
-                    exported_impedance=Z,
+                    original_frequency=freq,
+                    exported_frequency=exported_frequency,
+                    exported_impedance=exported_impedance,
                     use_relabel_simulation=use_relabel_simulation,
                 )
 
@@ -2495,13 +2636,43 @@ class DataGen:
         row: pd.Series,
         sample_index: int,
         metadata_path: Path,
+        original_frequency: np.ndarray,
         exported_frequency: np.ndarray,
         exported_impedance: np.ndarray,
         use_relabel_simulation: bool,
     ) -> Path:
-        """Write reproducibility and debugging metadata for one exported sample."""
+        """Write metadata with every frequency-aligned array in ascending order."""
+        original_frequency = np.asarray(original_frequency, dtype=float)
+        original_impedance = np.asarray(row.get("Z"))
+        exported_frequency = np.asarray(exported_frequency, dtype=float)
+        exported_impedance = np.asarray(exported_impedance)
+
+        if original_frequency.ndim != 1 or exported_frequency.ndim != 1:
+            raise ValueError("Metadata frequency arrays must be one-dimensional")
+        if original_impedance.shape[:1] != original_frequency.shape:
+            raise ValueError(
+                "Original frequency and impedance arrays must have the same length"
+            )
+        if exported_impedance.shape[:1] != exported_frequency.shape:
+            raise ValueError(
+                "Exported frequency and impedance arrays must have the same length"
+            )
+
+        original_order = np.argsort(original_frequency, kind="stable")
+        exported_order = np.argsort(exported_frequency, kind="stable")
+        original_frequency = original_frequency[original_order].copy()
+        original_impedance = original_impedance[original_order].copy()
+        exported_frequency = exported_frequency[exported_order].copy()
+        exported_impedance = exported_impedance[exported_order].copy()
+
+        normalized_curve = row.get("curve")
+        if isinstance(normalized_curve, (list, tuple)) and len(normalized_curve) == 2:
+            normalized_curve = tuple(
+                np.asarray(axis)[original_order].copy() for axis in normalized_curve
+            )
+
         metadata = {
-            "schema_version": 1,
+            "schema_version": 2,
             "sample_index": int(sample_index),
             "initial_circuit": row.get("original_ecm"),
             "initial_parameters": row.get("params"),
@@ -2524,10 +2695,11 @@ class DataGen:
                 "global_position": row.get("global_position"),
             },
             "data": {
-                "stored_original_impedance": row.get("Z"),
-                "normalized_curve": row.get("curve"),
-                "exported_frequency_hz": np.asarray(exported_frequency).copy(),
-                "exported_impedance": np.asarray(exported_impedance).copy(),
+                "stored_original_frequency_hz": original_frequency,
+                "stored_original_impedance": original_impedance,
+                "normalized_curve": normalized_curve,
+                "exported_frequency_hz": exported_frequency,
+                "exported_impedance": exported_impedance,
                 "exported_from_final_simulation": bool(use_relabel_simulation),
             },
             "status": {
@@ -2621,11 +2793,14 @@ class DataGen:
             Z = np.asarray(row["Z"])
 
         freq = self.random_ecm_freq.copy()
+        freq_order = np.argsort(freq, kind="stable")
+        exported_frequency = freq[freq_order]
+        exported_impedance = Z[freq_order]
         curve_df = pd.DataFrame(
             {
-                "freq": freq,
-                "Z_real": np.real(Z),
-                "Z_imag": np.imag(Z),
+                "freq": exported_frequency,
+                "Z_real": np.real(exported_impedance),
+                "Z_imag": np.imag(exported_impedance),
             }
         )
 
@@ -2638,8 +2813,9 @@ class DataGen:
             row=row,
             sample_index=sample_index,
             metadata_path=metadata_path,
-            exported_frequency=freq,
-            exported_impedance=Z,
+            original_frequency=freq,
+            exported_frequency=exported_frequency,
+            exported_impedance=exported_impedance,
             use_relabel_simulation=use_relabel_simulation,
         )
 

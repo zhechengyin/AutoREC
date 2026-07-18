@@ -457,7 +457,7 @@ def full_simplify(
     Pn_low: Optional[float] = 0.1,
     Pn_high: Optional[float] = 0.9,
     Rct_to_Z_scale=0.01,
-    identifiability_thresh=1e-4,
+    identifiability_thresh=1e-5,
     participation_thresh=0.2,
     chi2_thresh=1e-3,
     refit_ecm=True,

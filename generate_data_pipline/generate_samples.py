@@ -35,6 +35,8 @@ EXCLUDED_SIMPLIFIED_ECMS = ("R1", "R1-C2")
 FIM_REFIT_MAX_ITERS = 10
 FIM_REFIT_MIN_ITERS = 1
 FIM_REFIT_MAX_NFEV = 100
+FIM_IDENTIFIABILITY_THRESH = 1e-5
+R1_VALUE = 1e-4
 
 
 start_time = time.perf_counter()
@@ -48,6 +50,8 @@ generator = DataGen(
     fim_refit_max_iters=FIM_REFIT_MAX_ITERS,
     fim_refit_min_iters=FIM_REFIT_MIN_ITERS,
     fim_refit_max_nfev=FIM_REFIT_MAX_NFEV,
+    fim_identifiability_thresh=FIM_IDENTIFIABILITY_THRESH,
+    r1_value=R1_VALUE,
     verbose=False,
 )
 
